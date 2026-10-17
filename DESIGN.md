@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-This document records the agreed architecture, persistence schema, execution lifecycle, and their rationale. It describes the intended system, not an implemented or verified system. Remaining details listed under **Open design decisions** still need agreement before their implementation.
+This document records the agreed architecture, persistence schema, execution lifecycle, database coordination behavior, worker operating defaults, and their rationale. It describes the intended system, not an implemented or verified system. Remaining details listed under **Open design decisions** still need agreement before their implementation.
 
 The initial implementation targets the must-have requirements in [PROJECT_DESCRIPTION.md](PROJECT_DESCRIPTION.md) and follows [AGENTS.md](AGENTS.md). Scalability influences component boundaries and concurrency guarantees from the start, while additional infrastructure and optimizations remain future work. `PROJECT_CONTEXT.md` was referenced in the project instructions but was not present on disk when this document was created.
 
@@ -69,7 +69,7 @@ These boxes are logical responsibilities, not a requirement for separate service
 
 - One Maven project with shared domain, persistence, and handler code, separated by responsibility.
 - One Spring Boot process running the API and coordinator together.
-- Multiple long-running worker processes using the same project with a worker runtime profile. Workers are reused across steps; containers are not created per step.
+- Initially two long-running worker processes using the same project with a worker runtime profile, each with capacity for two concurrent handlers. Workers are reused across steps; containers are not created per step.
 - One PostgreSQL instance with persistent storage.
 - Docker Compose starts the application, workers, and database.
 
@@ -314,7 +314,7 @@ stateDiagram-v2
 
 The persistence design uses `max_attempts`, including the initial attempt, to avoid ambiguity between attempts and retries. Every successfully claimed attempt counts against its step's allowance in that cycle, including attempts later abandoned. Unclaimed work does not consume allowance. Count attempts by step and cycle while protecting the claim transaction from concurrent updates.
 
-Use capped exponential backoff with multiplier 2. After the nth unsuccessful attempt in the current cycle, delay the next attempt by `min(backoff_max_ms, backoff_initial_ms * 2^(n - 1))`, calculated without arithmetic overflow. Persist the effective limit and backoff values on the step. API defaults, lease/heartbeat timings, and handler-specific non-retryable failures remain open; no additional failure classification is assumed yet.
+Use capped exponential backoff with multiplier 2. After the nth unsuccessful attempt in the current cycle, delay the next attempt by `min(backoff_max_ms, backoff_initial_ms * 2^(n - 1))`, calculated without arithmetic overflow. Persist the effective limit and backoff values on the step. API defaults and handler-specific non-retryable failures remain open; no additional failure classification is assumed yet. Lease and heartbeat defaults are defined under **Worker runtime and operating defaults**.
 
 ### Workflow failure and manual retry
 
@@ -333,6 +333,142 @@ For `A -> B -> C`, if A completed, B exhausted its allowance, and C never ran, m
 
 Settled attempts do not guarantee all stale external code has stopped. Idempotency remains necessary even after manual retry passes its ownership checks.
 
+## Database coordination protocol
+
+### Chosen approach: workflow-row lock plus conditional updates
+
+Use one explicit workflow-row lock as the shared coordination point for claims, dependency promotion, outcome finalization, workflow failure/completion, recovery, and manual retry. Within that short transaction, use conditional step updates wherever sufficient, rather than automatically issuing a separate explicit lock query for every step and attempt. Ordinary updates still acquire database locks; this approach reduces explicit lock management rather than eliminating locking.
+
+Acquire the workflow lock before modifying its step and history records. When an operation must explicitly lock multiple step rows, determine the affected set and acquire those locks in step-ID order. Recheck conditions under the relevant locks. Heartbeats are the exception: they perform a conditional ownership update on one step and never acquire the parent workflow lock afterward. Keep all handler code and external calls outside these transactions.
+
+This serializes short state-changing decision transactions within one workflow, while handlers and different workflows run concurrently. The persistence layer owns these rules through operations such as claim, renew, record outcome, recover, and retry; callers and business handlers do not reproduce them independently.
+
+Use database wall-clock time for lease decisions, evaluated at the guarded mutation after any relevant lock wait. A timestamp fixed at transaction start may already be stale by then. The SQL must preserve that ordering; explicitly lock the target step where needed to make the time check reliable. The workflow lock alone does not prevent a lease renewal from changing a step's expiration.
+
+### Claim
+
+An idle worker first reserves a local handler slot, then discovers a candidate. Candidate discovery establishes no ownership. Under the workflow lock, recheck that:
+
+- The workflow is `PENDING` or `RUNNING` and the claim belongs to its current cycle.
+- The step is `PENDING` or `RETRYING`, its eligibility has arrived, and every dependency is `COMPLETED`.
+- The step has remaining attempt allowance in this cycle.
+
+In one transaction, increment the lifetime attempt/fencing counter, assign the worker and lease, clear eligibility, mark the step `RUNNING`, and insert its attempt. On the first claim of a cycle, also mark execution and cycle `RUNNING` and set their applicable start timestamps. If conditions no longer match, return no claim without creating an attempt.
+
+Start the handler only after the claim commit is confirmed and the worker's conservative local ownership window remains valid. A worker that loses the competition releases its reserved slot and can look for other work. Workers do not directly take over expired `RUNNING` claims; recovery must first close the previous attempt.
+
+### Renewal and fencing
+
+A heartbeat extends the lease only if the step is `RUNNING`, the worker ID and attempt token match, and the existing lease is still unexpired at the guarded update. A successful renewal sets a new expiration based on current database time. It does not increment the fencing token or create an attempt.
+
+An expired lease cannot be revived. A valid running attempt may still renew after another step has failed the workflow, because already-running work is allowed to finish. A stale or rejected renewal changes nothing. No heartbeat or per-worker liveness table is needed; ownership is tracked per step.
+
+### Outcome reporting
+
+Acquire the workflow lock and verify the current attempt's worker, token, cycle, running state, and unexpired lease before recording a new outcome. Reject an expired or superseded report without altering current state. Apply the following effects atomically, using the shared engine/persistence operation rather than business-handler code:
+
+| Accepted outcome | Transactional effects |
+| --- | --- |
+| Success | Complete attempt and step, write result/output, clear current step errors, and clear ownership. |
+| Failure with allowance remaining and workflow active | Fail the attempt, clear ownership, move the step to `RETRYING`, and persist its next eligibility time. |
+| Failure exhausting allowance while workflow active | Fail attempt and step, fail execution and current cycle, preserve the triggering error, and fail all waiting steps with `WORKFLOW_FAILED`. |
+| Failure after the workflow already failed | Fail attempt and step and clear ownership, without scheduling another attempt. |
+
+Permanent workflow failure is applied in this transaction, not deferred to the next coordinator scan. Valid success after workflow failure only completes that step; it never reopens the workflow or promotes downstream work.
+
+### Dependency promotion and workflow completion
+
+The coordinator periodically examines active workflows. Under the workflow lock, make a `PENDING` step eligible only when all prerequisites are complete and eligibility has not already been set. Leave existing eligibility and retry-backoff timestamps intact. Root steps have no dependency barrier.
+
+Finalize execution and current cycle as `COMPLETED` only when the workflow is active and every required step is `COMPLETED`. Repeated scans and competing coordinators must be harmless: they cannot create attempts, duplicate retries, reset backoff, or overwrite terminal outcomes. Workers persist successful results; the coordinator performs dependency promotion and success finalization from durable state.
+
+### Expired-attempt recovery
+
+Discover potentially expired leases, then acquire the workflow lock and recheck the target step and attempt against current database time. A heartbeat may have renewed ownership since discovery. If it is no longer expired or the attempt already settled, do nothing.
+
+For a still-expired claim, atomically mark the attempt `ABANDONED`, record the lease-expiry reason and observation time, and clear ownership. Schedule retry only when the workflow is active and allowance remains. Otherwise fail the step and, if this exhausts allowance on an active workflow, fail execution, cycle, and waiting steps in the same transaction.
+
+Scan running leases on failed workflows as well as active workflows. Recovery records abandonment; it does not prove the former handler stopped. Competing recovery scans cannot close the same attempt twice or schedule duplicate work.
+
+### Manual retry and uncertain responses
+
+Manual retry uses the same workflow lock and the lifecycle transaction described above. Recheck failed status and the absence of unfinished attempts under that lock. Two simultaneous requests cannot create two next cycles: after one succeeds, the other finds an active workflow and is rejected as no longer eligible for retry.
+
+A connection can fail after a commit but before its response arrives. Reconcile against durable state before repeating an operation:
+
+- For an uncertain claim, confirm the current claim, attempt identity, ownership, and lease before starting the handler. Do not blindly create another claim. If ownership cannot be confirmed within the local safety window, let database recovery resolve the claim without executing it.
+- For an uncertain outcome write, query the attempt. If its terminal outcome was already recorded, return that stored outcome without rewriting it or creating another attempt. Otherwise, retry reporting only while ownership remains valid and the worker has not given up the attempt.
+- Do not rerun a handler merely because storing its result failed. Retain its result while attempting safe reporting; if it cannot be recorded before ownership is lost, the engine may later execute another attempt under at-least-once semantics.
+
+Database transaction retries, when required after a rollback, repeat only database coordination work, never handler execution or external effects. An uncertain commit requires reconciliation rather than assuming rollback.
+
+### Race-condition alternatives and trade-offs
+
+Ownership validation and concurrency control are separate concerns. Every alternative still needs atomic state changes, attempt limits, leases, and fencing. Conditional updates on only a step cannot protect workflow-wide rules: a worker could read an active workflow, another transaction fail it, and the worker then claim a different step based on the earlier read.
+
+| Approach | Benefits | Trade-offs and decision |
+| --- | --- | --- |
+| Workflow-row lock plus conditional updates | One shared coordination point makes workflow failure, claims, completion, and manual retry straightforward. Conditional updates avoid unnecessary explicit pre-locking of every record; heartbeats remain independent. | **Chosen initially.** Short decisions within one workflow serialize, so very large workflows may contend on that row. Measure before adding more granular coordination. |
+| Optimistic concurrency with version columns | Update only if an expected version still matches; reload and retry on conflict. Useful when conflicts are uncommon. | A step version alone cannot detect workflow failure. Cross-record rules need a shared workflow-version check/update or another protocol. All relevant paths must participate; retries add complexity and a shared version can remain a contention point. |
+| Serializable transactions | PostgreSQL detects transaction patterns inconsistent with serial execution, reducing some explicit application-managed locking. | Requires correct business predicates and whole-transaction retries after serialization failures. Adds monitoring/retry costs under contention; does not replace fencing, lease-time checks, or explicitly establishing the required ordering of claims and workflow failure. Deferred in favor of the more explicit initial protocol. |
+| Transaction-level advisory lock per workflow | Gives cooperating processes one workflow-level coordination key without explicitly locking the workflow row. PostgreSQL releases it at transaction end. | All relevant code must cooperate and use consistent keys. Adds another locking convention and offers little per-workflow concurrency improvement over locking the existing row. Not selected initially. |
+| One authoritative coordinator per workflow | Route state-changing commands through a single owner that processes them sequentially. | Requires command routing, owner assignment, failover, and stale-owner protection. Substantial architectural work compared with the PostgreSQL coordination already required; defer. |
+
+`SKIP LOCKED` may help candidate discovery avoid waiting behind busy rows, but is a queue-access optimization, not a replacement for the workflow gate or fencing checks. Any such optimization must retain workflow-before-step ordering for state changes rather than locking candidate steps first and then their workflow.
+
+These comparisons are design trade-offs, not benchmark results. PostgreSQL documents [row and advisory locks](https://www.postgresql.org/docs/current/explicit-locking.html), [isolation levels and serialization retries](https://www.postgresql.org/docs/current/transaction-iso.html), [SKIP LOCKED](https://www.postgresql.org/docs/current/sql-select.html), and [database time-function semantics](https://www.postgresql.org/docs/current/functions-datetime.html).
+
+## Worker runtime and operating defaults
+
+These are configurable starting defaults, not measured performance claims or hard recovery guarantees. They do not require additional tables or change the execution model.
+
+| Setting | Initial default | Reason |
+| --- | --- | --- |
+| Lease duration | 30 seconds | Balance crash recovery time against tolerance for temporary delays. |
+| Heartbeat interval | 5 seconds | Allow several renewal opportunities before expiration. |
+| Worker polling interval when idle | 1 second | Discover available work promptly with modest polling traffic. |
+| Coordinator advancement interval | 1 second | Promote dependencies and finalize successful workflows promptly. |
+| Expired-lease scan interval | 5 seconds | Recovery can run less frequently than normal advancement. |
+| Concurrent handlers per worker | 2 | Demonstrate parallelism with bounded resource use. |
+| Database-operation timeout budget | 2 seconds | Bound time spent acquiring a connection and performing a control operation rather than allowing it to hang indefinitely. |
+| Local lease safety margin | 5 seconds | Give up before the last confirmed ownership window is expected to expire. |
+| Graceful shutdown drain period | 30 seconds | Allow existing attempts to finish without indefinitely delaying shutdown. |
+
+Start with two workers, for up to four concurrent handlers. Environment/application configuration exposes these values. Validate positive durations and capacity, and require heartbeat and database-operation budgets to fit within the lease window with its safety margin. The database-operation budget must be implemented across connection acquisition, lock/query execution, and network handling, rather than assuming one timeout setting covers all stages.
+
+### Capacity and control scheduling
+
+Reserve a handler slot before attempting a claim. Do not prefetch leased steps into an unbounded local queue. Release the reservation when no claim is acquired, or retain it through the actual handler execution. Once capacity becomes free, a worker may poll immediately; use the idle polling interval only when no work is found. Add small randomized idle-poll delays to reduce synchronized queries across workers, and avoid overlapping poll invocations that could over-reserve capacity.
+
+Run heartbeat/control scheduling separately from the handler executor, with sufficient scheduling and database-connection capacity for concurrent renewals. Slow handlers must not starve their own heartbeats, and one delayed database call must not indefinitely block other attempts' renewal tasks. Do not issue overlapping renewal requests for the same attempt or let an older response replace a newer local ownership confirmation.
+
+Use a distinct worker-instance ID for each process startup. A restarted process does not inherit the previous process's claims; their leases are recovered normally. Database ownership is per step, not inferred from a separate list of healthy worker nodes.
+
+### Local ownership tracking and renewal failures
+
+Track a conservative local ownership window using monotonic elapsed time, not comparisons between the worker's wall clock and the database's expiration timestamp. For a confirmed claim or renewal, base the local deadline on the start of that request:
+
+`local deadline = request start + lease duration - safety margin`
+
+With the defaults, the worker gives up roughly 25 seconds after that request began unless a later renewal is confirmed. Starting the window before the database operation accounts conservatively for request/response delays. A response received after that deadline does not authorize starting or resuming a handler. Unconfirmed requests never extend the local deadline. The local deadline is a best-effort guard; database lease/fencing checks remain authoritative, including after a process pause.
+
+| Renewal result | Worker behavior |
+| --- | --- |
+| Confirmed success | Update the local ownership deadline and continue the attempt. |
+| Explicit rejection because ownership, token, state, or lease no longer matches | Immediately give up the attempt and request handler cancellation. |
+| Timeout or connectivity error | Treat renewal as uncertain; retry approximately every second, one request at a time, only within the window from the last confirmed claim/renewal. |
+| Local safety deadline reached without another confirmation | Give up the attempt even if PostgreSQL might have committed an unacknowledged renewal. |
+
+Giving up is irreversible for that local attempt: stop initiating renewals and outcome writes, request best-effort cancellation/interruption, and discard later handler results. In-flight database operations remain subject to ownership checks and may require reconciliation. Let coordinator recovery decide abandonment and retry; the worker does not overwrite execution state merely because it lost confidence in ownership.
+
+Interruption cannot reliably stop arbitrary Java code or external requests. A handler that ignores interruption continues occupying its execution slot until it actually exits; losing ownership does not free capacity to launch an unbounded number of additional handlers. External side effects can still occur, which is why idempotency is required. Logging must distinguish reported failures, explicit ownership loss, uncertain renewal, and abandonment.
+
+### Shutdown and recovery expectations
+
+On orderly shutdown, stop new claims, keep renewing existing valid attempts, and allow the configured drain period for execution and outcome reporting. At the end of that period, request cancellation and stop renewing unfinished attempts. Container termination settings must allow the drain period plus process-cleanup time. A crash skips draining and is handled through lease expiry.
+
+With a healthy database and available coordinator, expiry should ordinarily be detected within approximately 35 seconds of the last lease extension: the 30-second lease plus up to 5 seconds until the next scan. Backoff, query/lock delays, coordinator load, and worker polling add further time before a replacement starts. This is an operating expectation, not a guaranteed deadline or a per-step execution timeout. Healthy long-running handlers can keep renewing indefinitely; user-configurable execution timeouts remain optional.
+
 ## State and reliability guarantees
 
 Workflow, step, and attempt states follow the lifecycle above. Each attempt and workflow cycle retains its own durable history, so automatic and manual retries do not overwrite earlier outcomes. Current step rows are mutable summaries; this schema does not promise a separate audit event for every intermediate step-state change.
@@ -345,9 +481,9 @@ Workflow, step, and attempt states follow the lifecycle above. Each attempt and 
 - Fencing tokens distinguish successive ownership attempts. An expired or superseded attempt cannot renew ownership or overwrite current execution state.
 - Dependency promotion, retry scheduling, recovery, and finalization must remain correct when multiple coordinators act concurrently. Starting with one coordinator must not make singleton execution a correctness requirement.
 - Essential progress and ownership are stored in PostgreSQL; in-memory state is only temporary execution state or an optimization.
-- Scheduling decisions, claims, attempt finalization/recovery, and manual retry acquire the parent workflow row before affected step rows, locking multiple steps in step-ID order. This serializes short decision transactions within one workflow, not handler execution; independent steps still execute concurrently and different workflows can advance independently.
+- Scheduling decisions, claims, attempt finalization/recovery, and manual retry use the workflow-row lock plus conditional updates described above. Explicitly lock additional step rows only where needed, preserving workflow-before-step ordering and step-ID order for multiple explicit step locks. Ordinary state/history writes remain transactional.
 - Lease renewals use conditional updates on the current step's state, owner, fencing token, and unexpired lease. They remain allowed for valid running attempts after workflow failure and do not require holding a workflow lock during handler execution.
-- Workflow failure and claims must use the same transaction ordering so a step cannot be newly claimed after failure commits. Detailed SQL and race-case verification remain implementation-design work.
+- Workflow failure and claims use the same workflow guard so a step cannot be newly claimed after failure commits. The protocol is settled; concrete SQL, timeout enforcement, and race-case verification are implementation work.
 
 ### Failure behavior and consistency trade-offs
 
@@ -367,7 +503,7 @@ The design favors consistent execution ownership and state over continued schedu
 
 Execution is **at least once**, subject to configured retry limits. Leases and fencing protect engine state; they do not guarantee exactly-once effects in external systems or prevent all overlap between stale and replacement handler code.
 
-Handlers should use idempotent operations or stable external idempotency keys where possible. The handler contract must document these assumptions. Cancellation of external work and compensation are outside the initial scope. Lease-based crash recovery is required even though user-configurable execution timeouts are optional.
+Handlers should use idempotent operations or stable external idempotency keys where possible. The handler contract must document these assumptions. Guaranteed cancellation of external work, user-facing workflow cancellation, and compensation are outside the initial scope; best-effort local handler interruption on ownership loss or shutdown is part of worker behavior. Lease-based crash recovery is required even though user-configurable execution timeouts are optional.
 
 ## Design choices and rationale
 
@@ -388,7 +524,12 @@ The following records the choices agreed in discussion and the alternatives they
 | Fail waiting work and let active attempts finish after workflow failure | Stops new execution while retaining truthful outcomes and avoiding cancellation machinery. `WORKFLOW_FAILED` distinguishes blocked work from handler failure. | Immediately failing and fencing active attempts rejects potentially useful results without reliably stopping external effects. The chosen policy can delay manual retry while a healthy attempt continues to hold its lease. |
 | Resume manual retry in a new cycle, preserving completed outputs | Avoids repeating successful work, keeps one execution identity, and preserves prior failures and attempt allowances. | Starting over is available through a new submission. Reusing outputs assumes their continued validity; refreshing inputs or all effects requires a new execution. |
 | Count abandoned claims toward a cycle's attempt limit | Gives crashes and repeated connectivity failures a bounded recovery policy. A successful claim, rather than a reported handler result, defines an attempt. | Excluding abandoned claims could retry indefinitely. This choice can exhaust allowance without a confirmed business failure; history exposes that distinction. |
-| Use short workflow-row locks for state-changing scheduling transactions | Provides an understandable ordering for claims, failure, completion, and manual retry, including future competing coordinators. | More granular coordination may improve large-workflow scheduling throughput but complicates terminal-state races. Locks do not span business execution; revisit granularity only if measured contention warrants it. |
+| Use a workflow-row lock plus conditional updates for coordination | Gives workflow-wide decisions one guard while avoiding unnecessary explicit pre-locking of every step/history row. Heartbeats remain independent and locks never span handler execution. | Optimistic versions, serializable transactions, advisory locks, and a single authoritative coordinator were compared under **Race-condition alternatives and trade-offs**. All retain ownership checks; each adds retries, conventions, or infrastructure. Revisit if measured contention warrants it. |
+| Renew a 30-second lease every 5 seconds, using a conservative local safety window | Tolerates brief delays while allowing reasonably prompt crash recovery. Local monotonic tracking avoids comparing unsynchronized worker/database wall clocks. | Shorter leases recover faster but increase false abandonment; longer leases delay recovery. Unconfirmed renewals never extend the worker's local window. Defaults remain tunable, and database fencing remains authoritative. |
+| Distinguish definite renewal rejection from uncertain connectivity | Reject stale owners immediately while permitting bounded renewal retries after temporary failures. Stop initiating work/results when the safety window ends. | Abandoning on every transient error causes unnecessary retries; continuing without a confirmed deadline risks prolonged stale execution. Cancellation remains best effort and slots stay occupied until handlers exit. |
+| Bound worker concurrency and separate heartbeats from handlers | Prevents leased work from waiting behind an unbounded local queue and prevents slow handlers from starving renewal. Two workers with two slots each demonstrate parallel execution. | Higher concurrency can improve throughput but increases database/downstream pressure. Tune capacity and connection budgets together rather than merely adding threads. |
+| Poll for advancement and recovery with configurable intervals | Keeps durable scheduling simple without introducing a broker or worker registry. | Polling adds latency and database traffic; shorter intervals trade load for responsiveness. Notifications or different delivery mechanisms remain future options if measurements justify them. |
+| Drain on shutdown, then cancel locally and let leases expire | Gives in-flight attempts a chance to finish while bounding orderly shutdown time. | Immediate shutdown creates avoidable abandoned attempts; unlimited draining can block deployment indefinitely. External actions may continue after cancellation. |
 | Keep the first release focused on must-have behavior | Correct execution, recovery, and reproducible verification take priority within the assignment's time constraints. | Additional infrastructure, dashboards, and advanced workflow features increase scope before the execution model is verified. |
 
 As detailed decisions are made, extend this record with the selected behavior, reasons, alternatives considered, and consequences. Keep proposals and unresolved questions distinct from agreed decisions.
@@ -417,10 +558,10 @@ Optional product capabilities remain deferred: cancellation, compensation, workf
 Before implementing the affected behavior, settle and record:
 
 1. The Java handler contract, input/output representation, dependency-output access, and error classification, including whether some failures are non-retryable.
-2. Detailed SQL for claim, renewal, fencing, dependency promotion, failure, completion, recovery, and manual retry; verify the specified lock ordering and transaction rules against races.
-3. Lease duration, heartbeat and polling intervals, worker capacity configuration, and worker behavior after renewal failures.
-4. API defaults for attempt limits and initial/maximum backoff delays. Attempt counting, capped exponential backoff, fresh per-cycle allowances, and treatment of abandoned attempts are settled above.
-5. API routes, payloads, error responses, and listing/history pagination, including how clients inspect cycles and distinguish failed workflows with still-running attempts.
+2. API defaults for attempt limits and initial/maximum backoff delays. Attempt counting, capped exponential backoff, fresh per-cycle allowances, and treatment of abandoned attempts are settled above.
+3. API routes, payloads, error responses, and listing/history pagination, including how clients inspect cycles and distinguish failed workflows with still-running attempts.
+
+The former coordination and worker-runtime discussion items are settled in **Database coordination protocol** and **Worker runtime and operating defaults**. Concrete SQL, framework/driver timeout settings, executor/connection sizing, and race-case verification remain implementation tasks governed by those decisions, not authorization to begin implementation. No coordination alternative is selected implicitly by an implementation convenience.
 
 ## Verification plan
 
@@ -437,7 +578,15 @@ Specific persistence and lifecycle scenarios include:
 - Reject manual retry while valid running attempts remain. Race simultaneous manual retries so only one next cycle is created.
 - Preserve completed outputs, definition, inputs, earlier cycles, and attempt history across manual retry; grant fresh allowances while keeping fencing tokens monotonically increasing.
 - Keep execution and current-cycle status consistent, distinguish blocked steps from executed failures, and complete only after all steps succeed.
+- Recheck expired-lease candidates after a concurrent heartbeat; stale discovery must not abandon a renewed claim.
+- Verify conditional updates and workflow guards preserve the specified race ordering without explicit pre-locking of every history row. Test actual PostgreSQL transactions, not only mocked repository calls.
+- Simulate a commit followed by a lost response for claim and outcome operations; reconcile durable state without duplicate claims, rewritten outcomes, or rerunning a handler solely to report its result.
+- Reject expired lease resurrection and use current database time after lock waits. Verify monotonic local safety deadlines across response delays and worker wall-clock changes.
+- Exercise transient renewal failures, explicit rejection, and safety-window expiry. Confirm unacknowledged renewals do not extend the local window and late responses/results do not resume a locally abandoned attempt.
+- Saturate handler capacity without starving heartbeats, bound in-flight claims, and retain capacity for handlers that ignore interruption. Use controllable test handlers so tests themselves cannot hang indefinitely.
+- Verify orderly shutdown stops new claims, renews during draining, and relinquishes unfinished attempts after the configured drain period.
+- Test invalid configuration and timeout-budget enforcement. Recovery timing tests should allow scheduling tolerance and distinguish expiry detection from backoff and replacement execution.
 
 Run focused tests during implementation and the full Maven suite at milestone boundaries. Verify Docker Compose startup and sample workflows from a fresh clone. These are planned checks, not results already achieved. Multi-coordinator operation and additional infrastructure require their own verification before being presented as supported.
 
-This document records architecture, persistence, and lifecycle decisions only. It does not complete the remaining detailed design or authorize the next implementation milestone.
+This document records architecture, persistence, lifecycle, coordination, and worker-runtime decisions only. It does not complete the remaining detailed design or authorize the next implementation milestone.
