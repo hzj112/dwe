@@ -17,7 +17,7 @@ Priority order:
 
 ### Milestone 3 — Parallel DAG execution and competing workers
 
-**Implementation checkpoint:** Authorized, implemented, and verified. Focused verification passed all nine new integration scenarios; full clean verification passed 24 unit tests and 30 integration tests without failures or skips. Image build and two-worker Compose startup passed. HTTP checks of sequential, parallel, and four-branch workflows confirmed overlap, join ordering, exclusive attempts, and both workers' participation within their capacity limits. The deployment and example extend the existing engine without production Java behavior, API, schema, or dependency changes. Milestone 4 has not been started.
+**Implementation checkpoint:** Authorized, implemented, verified, and committed as `1136fc8`. Focused verification passed all nine new integration scenarios; full clean verification passed 24 unit tests and 30 integration tests without failures or skips. Image build and two-worker Compose startup passed. HTTP checks of sequential, parallel, and four-branch workflows confirmed overlap, join ordering, exclusive attempts, and both workers' participation within their capacity limits. The deployment and example extend the existing engine without production Java behavior, API, schema, or dependency changes. Subsequent milestone 4 work is recorded below.
 
 **Outcome:** Demonstrate correct execution across multiple workers.
 
@@ -31,6 +31,8 @@ Priority order:
 **Reason for this boundary:** Establish normal distributed execution before introducing recovery from interrupted execution.
 
 ### Milestone 4 — Crash recovery and connectivity failures
+
+**Implementation checkpoint:** Authorized, implemented, and verified. Clean verification passed 29 unit tests and 47 PostgreSQL integration tests without failures or skips. `RecoveryCoordinator` and guarded recovery settle expired attempts, while explicit terminal-outcome lookup reconciles lost result responses. New tests cover ownership deadlines, recovery/renewal races, uncertainty, and shutdown. The portable container script built the image and verified process death, worker network isolation, and a full database pause; all recovered with one abandoned and one completed attempt plus downstream completion. No public API or schema changes were needed. Milestone 5 has not started.
 
 **Outcome:** Interrupted work recovers automatically without accepting stale results.
 

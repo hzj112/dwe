@@ -1,0 +1,10 @@
+{
+  "definition": {
+    "steps": [
+      {"id": "work", "actionType": "DELAY", "parameters": {"durationMs": 8000},
+       "retry": {"maxAttempts": 3, "backoffInitialMs": 200, "backoffMaxMs": 2000}},
+      {"id": "finish", "actionType": "ECHO", "dependsOn": ["work"]}
+    ]
+  },
+  "inputs": {"reference": "recovery-demo"}
+}

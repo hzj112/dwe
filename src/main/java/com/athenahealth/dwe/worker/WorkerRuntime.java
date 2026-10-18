@@ -138,6 +138,18 @@ public class WorkerRuntime implements SmartLifecycle {
                     else store.complete(claim, output);
                     return;
                 } catch (RuntimeException e) {
+                    // A committed completion can make the next heartbeat reject renewal. Read its durable
+                    // outcome immediately; reconciliation is read-only and does not revive local ownership.
+                    try {
+                        var recorded = store.recordedOutcome(claim);
+                        if (recorded.isPresent()) {
+                            log.info("Reconciled execution {} step {} attempt {} as {}", claim.executionId(),
+                                    claim.stepId(), claim.attemptNo(), recorded.get().status());
+                            return;
+                        }
+                    } catch (RuntimeException unavailable) {
+                        log.debug("Outcome reconciliation unavailable for execution {} step {}", claim.executionId(), claim.stepId());
+                    }
                     log.warn("Outcome write unavailable for execution {} step {}; retrying within lease",
                             claim.executionId(), claim.stepId());
                     try { Thread.sleep(200); }

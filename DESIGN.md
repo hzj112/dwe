@@ -22,6 +22,16 @@ Three worker-runtime integration tests use bounded handler gates to demonstrate 
 
 A clean Maven verification passed 24 unit tests and 30 integration tests with no failures or skips. The image built and an isolated `docker-compose up --build -d --wait` started PostgreSQL, API, and both worker replicas. HTTP smoke tests completed the sequential and parallel samples plus a four-branch workflow; persisted attempt timestamps showed branch overlap and correct join ordering, with two concurrent branches owned by each worker in the four-branch case. Every step had one completed attempt. The two-worker configuration and parallel example are documented in README. Expired-attempt recovery and connectivity failures remain milestone 4; complete retry/manual-retry behavior and listing/history APIs remain milestones 5 and 6 respectively. [Milestones.md](Milestones.md) supersedes the older combined milestone breakdown in Plan.md.
 
+## Implementation checkpoint: milestone 4
+
+Expired claims are now recovered by `RecoveryCoordinator` every 5 seconds. `WorkflowStore.recoverExpired()` discovers at most 100 candidates per pass, then rechecks each exact attempt in a short workflow-before-step transaction using current database time after lock acquisition. It records `ABANDONED` with `LEASE_EXPIRED`, clears ownership, and either schedules persisted exponential backoff or fails the step/workflow when allowance is exhausted. Running attempts on failed workflows are also recovered, without automatic retry or replacement of the original cycle error. Repeated/concurrent scans are harmless. No schema or client API changes were required.
+
+Outcome reporting now explicitly reads immutable attempt history after a write exception. This handles a committed completion whose lost response races a heartbeat rejection: the worker recognizes the durable terminal result without rewriting it or reinvoking the handler. An uncommitted write may be retried while local ownership remains valid. Reading an old terminal outcome never renews or revives ownership. Local cancellation logs distinguish deadline expiry, renewal rejection, and shutdown; uncertainty remains separate from confirmed rejection.
+
+Clean Maven verification passed 29 unit tests and 47 PostgreSQL integration tests without failures, errors, or skips. New tests cover recovery/backoff/allowance limits, concurrent recovery, delayed heartbeat commits, database-time checks after lock waits, stale reports, lost claim/result responses, pre-commit result-write failure, local deadlines, independent renewal scheduling, graceful draining, and handlers that ignore interruption. A stale IDE-generated test class encountered during an incremental run was eliminated by clean Maven compilation; no test was skipped or weakened.
+
+The portable `scripts/verify-recovery.py` built an isolated image/Compose stack and passed three actual fault scenarios: worker process death, worker/database network isolation, and a full PostgreSQL pause. Each execution recorded attempt 1 as `ABANDONED`, attempt 2 as `COMPLETED` after backoff, and successful downstream execution. The process-death and partition cases used a different replacement worker. Its temporary configuration uses a 5-second lease; production defaults remain the 30-second lease and 5-second scan. The script removes only its own unique project's containers, network, volume, and image. Milestone 5 and subsequent work have not started.
+
 The initial implementation targets the must-have requirements in [PROJECT_DESCRIPTION.md](PROJECT_DESCRIPTION.md) and follows [AGENTS.md](AGENTS.md). Scalability influences component boundaries and concurrency guarantees from the start, while additional infrastructure and optimizations remain future work. `PROJECT_CONTEXT.md` was referenced in the project instructions but was not present on disk when this document was created.
 
 ## Goals
@@ -693,6 +703,8 @@ Discover potentially expired leases, then acquire the workflow lock and recheck 
 
 For a still-expired claim, atomically mark the attempt `ABANDONED`, record the lease-expiry reason and observation time, and clear ownership. Schedule retry only when the workflow is active and allowance remains. Otherwise fail the step and, if this exhausts allowance on an active workflow, fail execution, cycle, and waiting steps in the same transaction.
 
+The implementation records the reason as `LEASE_EXPIRED` on the attempt and step, with `finished_at` marking observation time. An abandoned attempt does not set `failure_retryable`, which is reserved for handler-reported failures. Candidate discovery is limited to 100 rows per pass; busy workflows are skipped for a later pass. This bounds one scan's work but is not a throughput or starvation guarantee under sustained load.
+
 Scan running leases on failed workflows as well as active workflows. Recovery records abandonment; it does not prove the former handler stopped. Competing recovery scans cannot close the same attempt twice or schedule duplicate work.
 
 ### Manual retry and uncertain responses
@@ -704,6 +716,8 @@ A connection can fail after a commit but before its response arrives. Reconcile 
 - For an uncertain claim, confirm the current claim, attempt identity, ownership, and lease before starting the handler. Do not blindly create another claim. If ownership cannot be confirmed within the local safety window, let database recovery resolve the claim without executing it.
 - For an uncertain outcome write, query the attempt. If its terminal outcome was already recorded, return that stored outcome without rewriting it or creating another attempt. Otherwise, retry reporting only while ownership remains valid and the worker has not given up the attempt.
 - Do not rerun a handler merely because storing its result failed. Retain its result while attempting safe reporting; if it cannot be recorded before ownership is lost, the engine may later execute another attempt under at-least-once semantics.
+
+`recordedOutcome` performs the read-only terminal lookup for the exact execution, step, attempt, cycle, and worker identity. It may reconcile an in-flight report after local cancellation, but does not permit new writes or renewed execution after cancellation. This avoids relying on the timing of the next heartbeat or a repeated report to recognize a committed outcome.
 
 Database transaction retries, when required after a rollback, repeat only database coordination work, never handler execution or external effects. An uncertain commit requires reconciliation rather than assuming rollback.
 
@@ -870,7 +884,7 @@ Optional product capabilities remain deferred: cancellation, compensation, workf
 
 The previously listed handler contract, retry defaults, API routes/payloads, coordination behavior, and worker operating defaults are recorded above. There are no remaining open items from that discussion list. The submission schema is part of the design contract; runtime semantic validation remains necessary. The checkpoint at the top identifies which API routes and behaviors are implemented.
 
-The SQL migration, Java/dependency versions, initial timeout and capacity settings, predefined ECHO/DELAY handlers, and milestone 2–3 race coverage are implemented as described in the checkpoints. Remaining work includes expired-attempt recovery, connectivity and uncertain-response verification, complete retry/manual-retry behavior, opaque history cursors and the remaining APIs, and delivery verification. These are implementation tasks governed by the recorded behavior and Milestones.md, not authorization to begin the next milestone or to select a different architecture implicitly.
+The SQL migration, Java/dependency versions, initial timeout and capacity settings, predefined ECHO/DELAY handlers, and milestone 2–4 execution/recovery coverage are implemented as described in the checkpoints. Remaining work includes complete retry/manual-retry acceptance, opaque history cursors and the remaining APIs, and final delivery verification. These are implementation tasks governed by the recorded behavior and Milestones.md, not authorization to begin the next milestone or to select a different architecture implicitly.
 
 Arbitrary execution without predefined registration, reusable definitions/schedules, workflow-code versioning, and HTTP idempotency keys remain deferred capabilities with the trade-offs recorded above. Design their execution and compatibility semantics before introducing them.
 

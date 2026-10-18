@@ -73,13 +73,21 @@ public class LeaseManager implements AutoCloseable {
 
         /** Also checks elapsed time directly, in case the scheduled deadline task has been delayed. */
         public boolean isCancelled() {
-            if (System.nanoTime() - deadline >= 0) cancel();
+            if (System.nanoTime() - deadline >= 0) cancel("local ownership deadline elapsed");
             return cancelled.get();
         }
 
         /** Signals cancellation and interrupts the handler; the database still fences any later report. */
         public void cancel() {
-            cancelled.set(true);
+            cancel("worker shutdown or local cancellation");
+        }
+
+        /** Logs the first ownership loss once; cancellation can never be reversed by a late heartbeat. */
+        private void cancel(String reason) {
+            if (cancelled.compareAndSet(false, true)) {
+                log.info("Stopping local execution {} step {} attempt {}: {}",
+                        claim.executionId(), claim.stepId(), claim.attemptNo(), reason);
+            }
             Thread thread = handlerThread;
             if (thread != null) thread.interrupt();
         }
@@ -92,7 +100,7 @@ public class LeaseManager implements AutoCloseable {
 
         private synchronized void checkExpiry() {
             if (closed) return;
-            if (System.nanoTime() - deadline >= 0) cancel();
+            if (System.nanoTime() - deadline >= 0) cancel("local ownership deadline elapsed");
             else scheduleExpiry();
         }
 
@@ -112,7 +120,8 @@ public class LeaseManager implements AutoCloseable {
                 synchronized (this) {
                     if (closed) return;
                     // Confirmation received after the previous local deadline cannot revive ownership.
-                    if (!accepted || isCancelled()) { cancel(); return; }
+                    if (!accepted) { cancel("database rejected lease renewal"); return; }
+                    if (isCancelled()) return;
                     deadline = requestStarted + properties.ownershipWindowNanos();
                     scheduleExpiry();
                 }

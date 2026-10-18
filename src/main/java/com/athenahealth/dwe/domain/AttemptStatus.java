@@ -1,4 +1,4 @@
 package com.athenahealth.dwe.domain;
 
-/** One execution attempt's outcome; ABANDONED is reserved for lease-expiry recovery in a later milestone. */
+/** One attempt's outcome; ABANDONED records lease expiry without asserting that external work stopped. */
 public enum AttemptStatus { RUNNING, COMPLETED, FAILED, ABANDONED }

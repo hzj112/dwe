@@ -2,11 +2,11 @@
 
 A Java 21 / Spring Boot application with PostgreSQL-backed workflow state and leased worker claims. Maven builds a single artifact that runs as either an API/coordinator or a worker process. The approved architecture is in [DESIGN.md](DESIGN.md); the current milestone breakdown is in [Milestones.md](Milestones.md), with earlier planning and environment checks in [Plan.md](Plan.md).
 
-## Current implementation: milestone 3
+## Current implementation: milestone 4
 
-This checkpoint implements validated submission, execution and step queries, Flyway-managed storage, handler registration, conditional claims, lease renewal, fencing, durable outcome reporting, and sequential/parallel DAG execution. Compose starts two worker containers by default, each with two handler slots. `ECHO` and `DELAY` are predefined demonstration handlers. API and workers run in separate containers using the same image.
+This checkpoint implements validated submission, execution and step queries, Flyway-managed storage, handler registration, conditional claims, lease renewal, fencing, durable outcome reporting, sequential/parallel DAG execution, and expired-attempt recovery. Compose starts two worker containers by default, each with two handler slots. `ECHO` and `DELAY` are predefined demonstration handlers. API and workers run in separate containers using the same image.
 
-This is not the complete assignment. Expired-attempt recovery and connectivity-failure behavior are milestone 4; full retry/manual-retry coverage is milestone 5; listing/history APIs are milestone 6. An interrupted running attempt currently remains `RUNNING` after its lease expires; it cannot report results or renew, but automatic reassignment requires the future recovery coordinator. Restart persistence checks therefore use completed workflows, not crash recovery.
+This is not the complete assignment. Recovery now settles expired attempts as `ABANDONED` and schedules another attempt when the workflow is active and allowance remains. Expiry exhausting the allowance fails the workflow; expired siblings on already-failed workflows are settled without retry. Complete retry/manual-retry coverage remains milestone 5; listing/history APIs remain milestone 6.
 
 ## Prerequisites and build
 
@@ -96,6 +96,27 @@ Wait for the API to become healthy after restart. Stop local services without de
 docker-compose down
 ```
 
+### Crash and connectivity recovery
+
+With Docker running and Python 3 installed, run the portable container checks from the repository root:
+
+```sh
+python3 scripts/verify-recovery.py
+```
+
+The script builds a uniquely tagged image and starts a separate Compose project on disposable host ports. It submits [recovery.json](examples/recovery.json), kills the owning worker, and verifies that the surviving worker completes a replacement attempt. It then checks a worker disconnected from the database network and a full PostgreSQL pause. Each case checks `ABANDONED → replacement COMPLETED` history, an increased attempt token, persisted backoff, and successful downstream execution. Tests use a 5-second lease and faster polling only in their temporary configuration; normal deployment defaults remain unchanged. Allow roughly one to two minutes on a warm Docker cache, plus build/startup time.
+
+Fault injection and cleanup affect only the uniquely named verification project. The script reconnects/unpauses its containers on error and removes its own containers, database volume, and temporary image afterward. The user's default Compose project and database volume are preserved. The script requires no third-party Python packages and is separate from Maven verification.
+
+To submit the recovery example to the ordinary local stack, use:
+
+```sh
+curl --fail -i -H 'Content-Type: application/json' \
+  --data-binary @examples/recovery.json http://localhost:8080/api/v1/executions
+```
+
+An abandoned attempt is an ownership observation, not proof that business code or external side effects stopped. The former owner cannot renew an expired lease or overwrite replacement results. Attempts abandoned after a crash or partition count against the step's total attempt limit, just like other claimed attempts.
+
 ## Local Java processes
 
 Start only the database, package the application, and run the roles in separate terminals:
@@ -112,13 +133,15 @@ The worker profile starts without an HTTP server. Enabling both roles in the sam
 
 ## Execution and handler contract
 
-The coordinator exposes a pending step for claiming only when every dependency is completed. Claims and lifecycle changes use short database transactions guarded by the workflow row; business handlers run outside transactions. Heartbeats update only the claimed step. Result writes require the current worker ID, lifetime attempt token, cycle, running state, and an unexpired database lease. A terminal attempt's stored outcome is immutable; retrying an uncertain report does not invoke the handler again.
+The coordinator exposes a pending step for claiming only when every dependency is completed. Claims and lifecycle changes use short database transactions guarded by the workflow row; business handlers run outside transactions. Heartbeats update only the claimed step. Result writes require the current worker ID, lifetime attempt token, cycle, running state, and an unexpired database lease. A terminal attempt's stored outcome is immutable. After a result-write exception, the worker reads the exact attempt's terminal outcome before retrying persistence; neither reconciliation nor another report invokes the handler again.
 
 Worker capacity defaults to two simultaneous handlers per process, for up to four across the two default Compose workers. Leases last 30 seconds, heartbeats run every 5 seconds, and the worker stops local work before its last confirmed lease can expire. Heartbeats and deadline checks use separate executors from handlers. Shutdown stops claiming and drains work for up to 30 seconds before requesting interruption. Cancellation is cooperative; a handler that ignores interruption keeps its slot until it exits.
 
+Recovery scans up to 100 expired candidates per pass every 5 seconds (`engine.recovery-interval`, overridable as `ENGINE_RECOVERY_INTERVAL`). Each candidate is rechecked against database time after the workflow/step locks; a heartbeat committed while recovery waited prevents false abandonment. With a healthy coordinator/database, expiry detection is ordinarily within about 35 seconds of the last extension, with backoff, load, and polling adding time before replacement execution. This is not a strict deadline or a step execution timeout. A healthy handler can keep renewing indefinitely.
+
 Implement `StepHandler`, expose it as a Spring bean, and rebuild the application to add an action type. Duplicate registrations fail startup; unknown types are rejected at submission. API and worker deployments must use the same registered set. `inputs`, `parameters`, and successful outputs are JSON objects. Each invocation receives isolated JSON and only direct dependency outputs. `ECHO` returns those inputs, parameters, and dependencies; `DELAY` requires an integer `durationMs` between 0 and 60000.
 
-Delivery semantics are **at least once**, not exactly once. Fencing protects engine records, not external side effects. Handlers should use the stable execution/step idempotency key or another appropriate deduplication mechanism. Unexpected ordinary exceptions are retryable; typed permanent failures fail the workflow immediately. Basic retry-state persistence and exponential backoff are present as foundations; recovery and full retry coverage remain milestones 4 and 5 respectively. Pending/retrying steps fail when the workflow fails; independent already-running steps may finish without reopening the workflow.
+Delivery semantics are **at least once**, not exactly once. Fencing protects engine records, not external side effects. Handlers should use the stable execution/step idempotency key or another appropriate deduplication mechanism. Unexpected ordinary exceptions are retryable; typed permanent failures fail the workflow immediately. Automatic backoff and abandonment limits are implemented; full retry/manual-retry acceptance remains milestone 5. Pending/retrying steps fail when the workflow fails; independent already-running steps may finish without reopening the workflow.
 
 No authentication, external-code execution, recurring schedules, cancellation API, compensation, or production deployment hardening is included in this checkpoint. Large-workflow query batching and database tuning also remain future work.
 
@@ -127,6 +150,8 @@ No authentication, external-code execution, recurring schedules, cancellation AP
 - Unit tests: structural and DAG validation, per-field retry defaults, immutable submission snapshot, handler registry, isolated handler context, cancellation, and overflow-safe backoff calculation.
 - PostgreSQL integration tests: migration repeatability, submission rollback, relational/JSON constraints, HTTP payloads and errors, exclusive competing claims, stale/expired ownership rejection, immutable duplicate reports, finite eligibility at the supported backoff boundary, permanent failure propagation, invalid handler output, sequential execution, worker restart retention, and heartbeat renewal beyond the original lease.
 - Milestone 3 integration tests: gated parallel branches and join outputs, two real worker runtimes competing for one step, per-worker capacity with excess work left unclaimed, failure racing with claims/completion in both transaction orders, failure of waiting retry steps, and conflicting concurrent outcome reports. Lock-race tests observe PostgreSQL's blocking sessions to establish ordering rather than relying on sleeps.
+- Milestone 4 tests: abandonment/backoff and allowance exhaustion, failed-workflow cleanup, competing recovery passes, heartbeat/recovery races, expiry after lock waits, stale-result rejection, lost claim/result responses, pre-commit write failure, transient renewal failure, graceful draining, and handlers that ignore interruption. Local deadline tests inject renewal responses; PostgreSQL integration tests verify durable ownership and history independently.
 - Container smoke test: build the shared image, start API/worker/PostgreSQL with the assignment's `docker-compose` command, submit the sample through HTTP, and verify stored results after application restart.
+- Portable container recovery verification: `scripts/verify-recovery.py` exercises actual process death, worker network isolation, and PostgreSQL unavailability using disposable infrastructure.
 
-Maven reports are under `target/surefire-reports` and `target/failsafe-reports`. Run the milestone 3 tests alone with `./mvnw -Dit.test=ParallelWorkflowIT,WorkflowConcurrencyIT verify`. Later milestones add recovery, complete retry/API coverage, and final delivery verification.
+Maven reports are under `target/surefire-reports` and `target/failsafe-reports`. Run milestone 3 integration tests with `./mvnw -Dit.test=ParallelWorkflowIT,WorkflowConcurrencyIT verify`, or milestone 4 integration tests with `./mvnw -Dit.test=LeaseRecoveryIT,WorkerFailureIT verify`. Both commands also run unit tests. Later milestones add complete retry/API coverage and final delivery verification.

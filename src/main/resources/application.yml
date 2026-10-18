@@ -27,6 +27,7 @@ engine:
   heartbeat-interval: 5s
   poll-interval: 1s
   coordinator-interval: 1s
+  recovery-interval: 5s
   operation-timeout: 2s
   safety-margin: 5s
   shutdown-grace: 30s

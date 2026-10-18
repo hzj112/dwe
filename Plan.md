@@ -20,6 +20,17 @@ The reviewed roadmap in [Milestones.md](Milestones.md) now supersedes this docum
 - No production Java behavior, public API, schema, or dependency changes were needed. The existing workflow guard and conditional ownership checks passed the added coverage.
 - Milestone 3 is complete. Recovery/connectivity behavior remains milestone 4, full retries/manual retry milestone 5, and listing/history APIs milestone 6. These have not been started.
 
+### Milestone 4 checkpoint
+
+Milestone 3 was committed as `1136fc8`. Milestone 4 was subsequently authorized, implemented, and verified.
+
+- Added the recovery scheduler and validated `engine.recovery-interval` setting (default 5 seconds). Recovery scans bounded candidate batches and uses the existing workflow/step lock ordering and live database time.
+- Expired attempts become `ABANDONED`; persisted backoff and attempt limits govern replacement. Expired siblings on failed workflows are settled without retry or loss of the original error.
+- Added read-only terminal-outcome reconciliation after uncertain result writes, plus distinct local cancellation diagnostics.
+- Added five local lease tests and seventeen PostgreSQL scenarios for recovery, uncertainty, and shutdown. Clean Maven verification passed 29 unit tests and 47 integration tests without failures, errors, or skips.
+- Added `examples/recovery.json` and the portable, commented `scripts/verify-recovery.py`. It built the image and isolated two-worker stack, then passed actual worker-kill, worker-partition, and database-pause checks with durable replacement and backoff evidence. Its own disposable containers, network, volume, and image were cleaned up.
+- No schema or public API changes were required. Complete retry/manual-retry acceptance remains milestone 5, listing/history APIs milestone 6, and final delivery milestone 7; none has started.
+
 ### Milestone 2 checkpoint
 
 The proposed project tree is generated, with an additional shared integration-test support class to avoid duplicating PostgreSQL/HTTP setup. Maven dependencies and the official Maven Wrapper were downloaded. The implementation and run instructions are documented in [README.md](README.md), and [DESIGN.md](DESIGN.md) now distinguishes this slice from the complete target architecture.

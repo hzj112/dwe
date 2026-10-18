@@ -32,6 +32,8 @@ import tools.jackson.databind.json.JsonMapper;
  */
 @Repository
 public class WorkflowStore {
+    private static final String LEASE_EXPIRED = "LEASE_EXPIRED";
+    private static final String LEASE_EXPIRED_MESSAGE = "Worker lease expired before an outcome was recorded";
     private final JdbcTemplate jdbc;
     private final JsonMapper json;
     private final EngineProperties properties;
@@ -50,6 +52,7 @@ public class WorkflowStore {
     /** Whether a report is recognized, plus its stored attempt outcome; duplicate reports return that outcome. */
     public record ReportResult(boolean accepted, AttemptStatus status) { }
     private record Candidate(UUID executionId, String stepId) { }
+    private record ExpiredCandidate(UUID executionId, String stepId, long attemptNo, int cycleNo, String workerId) { }
     private record WorkflowRow(String status, int cycleNo, JsonNode inputs) {
         boolean active() { return status.equals("PENDING") || status.equals("RUNNING"); }
     }
@@ -217,12 +220,79 @@ public class WorkflowStore {
                 """, Boolean.class, claim.executionId(), claim.stepId(), claim.workerId(), claim.attemptNo(), claim.cycleNo()));
     }
 
+    /**
+     * Discovers a bounded batch of expired claims without assuming their owners have stopped running.
+     * Each candidate is rechecked in its own guarded transaction; failed workflows are included.
+     */
+    public int recoverExpired() {
+        List<ExpiredCandidate> candidates = jdbc.query("""
+                SELECT s.workflow_id, s.step_id, s.last_attempt_no, a.cycle_no, s.worker_id
+                FROM step_execution s JOIN step_attempt a ON a.workflow_id = s.workflow_id
+                  AND a.step_id = s.step_id AND a.attempt_no = s.last_attempt_no
+                WHERE s.status = 'RUNNING' AND a.status = 'RUNNING' AND s.lease_expires_at <= clock_timestamp()
+                ORDER BY s.lease_expires_at, s.workflow_id, s.step_id LIMIT 100
+                """, (rs, row) -> new ExpiredCandidate(rs.getObject(1, UUID.class), rs.getString(2),
+                rs.getLong(3), rs.getInt(4), rs.getString(5)));
+        int recovered = 0;
+        for (ExpiredCandidate candidate : candidates) {
+            if (Boolean.TRUE.equals(inTransaction(() -> recover(candidate)))) recovered++;
+        }
+        return recovered;
+    }
+
+    /** Settles one exact attempt; a newer claim or a committed heartbeat invalidates stale discovery. */
+    private boolean recover(ExpiredCandidate candidate) {
+        Optional<WorkflowRow> selected = workflow(candidate.executionId(), true);
+        if (selected.isEmpty() || selected.get().cycleNo() != candidate.cycleNo()) return false;
+        WorkflowRow workflow = selected.get();
+        StepRow step = lockStep(candidate.executionId(), candidate.stepId());
+        if (!step.status().equals("RUNNING") || step.attemptNo() != candidate.attemptNo()
+                || !candidate.workerId().equals(step.workerId())) return false;
+        int attempts = attemptCount(candidate.executionId(), candidate.stepId(), candidate.cycleNo());
+        boolean retry = workflow.active() && attempts < step.retry().maxAttempts();
+        long delay = retry ? step.retry().delayAfter(attempts) : 0;
+        // Evaluate database time after the step lock: a heartbeat may have committed while we waited.
+        int updated = jdbc.update("""
+                UPDATE step_execution SET status = ?, worker_id = NULL, lease_expires_at = NULL,
+                    eligible_at = CASE WHEN ? THEN clock_timestamp() + (? * interval '1 millisecond') ELSE NULL END,
+                    error_code = ?, error_message = ?, updated_at = clock_timestamp()
+                WHERE workflow_id = ? AND step_id = ? AND status = 'RUNNING' AND last_attempt_no = ?
+                  AND worker_id = ? AND lease_expires_at <= clock_timestamp()
+                """, retry ? "RETRYING" : "FAILED", retry, delay, LEASE_EXPIRED, LEASE_EXPIRED_MESSAGE,
+                candidate.executionId(), candidate.stepId(), candidate.attemptNo(), candidate.workerId());
+        if (updated != 1) return false;
+        int closed = jdbc.update("""
+                UPDATE step_attempt SET status = 'ABANDONED', finished_at = clock_timestamp(),
+                    error_code = ?, error_message = ?
+                WHERE workflow_id = ? AND step_id = ? AND attempt_no = ? AND cycle_no = ?
+                  AND worker_id = ? AND status = 'RUNNING'
+                """, LEASE_EXPIRED, LEASE_EXPIRED_MESSAGE, candidate.executionId(), candidate.stepId(),
+                candidate.attemptNo(), candidate.cycleNo(), candidate.workerId());
+        // Roll back the step change if history no longer matches; never leave partially settled ownership.
+        if (closed != 1) throw new IllegalStateException("Expired step has no matching running attempt");
+        if (!retry && workflow.active()) {
+            failWorkflow(candidate.executionId(), candidate.cycleNo(), candidate.stepId(), LEASE_EXPIRED, LEASE_EXPIRED_MESSAGE);
+        }
+        return true;
+    }
+
     /** Records successful output if the attempt still owns the step, or returns its prior stored outcome. */
     public ReportResult complete(StepClaim claim, JsonNode output) {
         if (output == null || !output.isObject()) {
             throw new IllegalArgumentException("Successful handler output must be a JSON object");
         }
         return finish(claim, output, null, null, false);
+    }
+
+    /** Reads an immutable terminal outcome after a lost report response, without renewing or changing ownership. */
+    public Optional<ReportResult> recordedOutcome(StepClaim claim) {
+        return jdbc.query("""
+                SELECT status FROM step_attempt WHERE workflow_id = ? AND step_id = ? AND attempt_no = ?
+                  AND cycle_no = ? AND worker_id = ? AND status <> 'RUNNING'
+                """, (rs, row) -> {
+            AttemptStatus status = AttemptStatus.valueOf(rs.getString(1));
+            return new ReportResult(status != AttemptStatus.ABANDONED, status);
+        }, claim.executionId(), claim.stepId(), claim.attemptNo(), claim.cycleNo(), claim.workerId()).stream().findFirst();
     }
 
     /** Records failure and either schedules a retry or permanently fails the step and workflow. */
@@ -277,27 +347,27 @@ public class WorkflowStore {
                     """, outcome.name(), success ? json.writeValueAsString(output) : null, code, message,
                     success ? null : retryable, claim.executionId(), claim.stepId(), claim.attemptNo());
             if (!success && !retry && workflow.active()) {
-                failWorkflow(claim, code, message);
+                failWorkflow(claim.executionId(), claim.cycleNo(), claim.stepId(), code, message);
             }
             return new ReportResult(true, outcome);
         });
     }
 
     /** Fails waiting steps; already-running attempts may finish without reopening the failed workflow. */
-    private void failWorkflow(StepClaim claim, String code, String message) {
+    private void failWorkflow(UUID executionId, int cycleNo, String failedStepId, String code, String message) {
         jdbc.update("""
                 UPDATE workflow_execution SET status = 'FAILED', finished_at = clock_timestamp(), updated_at = clock_timestamp()
                 WHERE id = ?
-                """, claim.executionId());
+                """, executionId);
         jdbc.update("""
                 UPDATE workflow_cycle SET status = 'FAILED', finished_at = clock_timestamp(), failed_step_id = ?,
                     error_code = ?, error_message = ? WHERE workflow_id = ? AND cycle_no = ?
-                """, claim.stepId(), code, message, claim.executionId(), claim.cycleNo());
+                """, failedStepId, code, message, executionId, cycleNo);
         jdbc.update("""
                 UPDATE step_execution SET status = 'FAILED', eligible_at = NULL, error_code = 'WORKFLOW_FAILED',
                     error_message = 'Execution stopped because another step failed', updated_at = clock_timestamp()
                 WHERE workflow_id = ? AND status IN ('PENDING','RETRYING')
-                """, claim.executionId());
+                """, executionId);
     }
 
     /** Locks the workflow until transaction end; schedulers may skip busy workflows instead of waiting. */

@@ -9,7 +9,7 @@ import com.athenahealth.dwe.domain.RetryPolicy;
 @ConfigurationProperties("engine")
 public record EngineProperties(
         Duration leaseDuration, Duration heartbeatInterval, Duration pollInterval,
-        Duration coordinatorInterval, Duration operationTimeout, Duration safetyMargin,
+        Duration coordinatorInterval, Duration recoveryInterval, Duration operationTimeout, Duration safetyMargin,
         Duration shutdownGrace, int workerConcurrency, int defaultMaxAttempts,
         long defaultBackoffInitialMs, long defaultBackoffMaxMs) {
 
@@ -19,6 +19,7 @@ public record EngineProperties(
         positive("heartbeat-interval", heartbeatInterval);
         positive("poll-interval", pollInterval);
         positive("coordinator-interval", coordinatorInterval);
+        positive("recovery-interval", recoveryInterval);
         positive("operation-timeout", operationTimeout);
         positive("safety-margin", safetyMargin);
         positive("shutdown-grace", shutdownGrace);

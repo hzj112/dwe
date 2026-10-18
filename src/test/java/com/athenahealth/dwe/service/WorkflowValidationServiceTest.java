@@ -21,7 +21,7 @@ class WorkflowValidationServiceTest {
 
     public static EngineProperties defaults() {
         return new EngineProperties(Duration.ofSeconds(30), Duration.ofSeconds(5), Duration.ofSeconds(1),
-                Duration.ofSeconds(1), Duration.ofSeconds(2), Duration.ofSeconds(5), Duration.ofSeconds(5),
+                Duration.ofSeconds(1), Duration.ofSeconds(5), Duration.ofSeconds(2), Duration.ofSeconds(5), Duration.ofSeconds(5),
                 2, 3, 1000, 30000);
     }
 
