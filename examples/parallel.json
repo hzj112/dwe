@@ -1,0 +1,12 @@
+{
+  "definition": {
+    "steps": [
+      {"id": "start", "actionType": "ECHO", "parameters": {"message": "parallel workflow"}},
+      {"id": "branch-b", "actionType": "DELAY", "parameters": {"durationMs": 3000}, "dependsOn": ["start"]},
+      {"id": "branch-c", "actionType": "DELAY", "parameters": {"durationMs": 5000}, "dependsOn": ["start"]},
+      {"id": "join", "actionType": "ECHO", "dependsOn": ["branch-b", "branch-c"]},
+      {"id": "finish", "actionType": "ECHO", "dependsOn": ["join"]}
+    ]
+  },
+  "inputs": {"reference": "parallel-demo"}
+}

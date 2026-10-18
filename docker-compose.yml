@@ -40,6 +40,9 @@ services:
     restart: unless-stopped
   worker:
     image: dwe:0.1.0-SNAPSHOT
+    # Independent processes share PostgreSQL claims; each keeps its own two-handler capacity.
+    deploy:
+      replicas: 2
     environment:
       <<: *application-environment
       SPRING_PROFILES_ACTIVE: worker

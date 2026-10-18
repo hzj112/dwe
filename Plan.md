@@ -8,6 +8,18 @@ The architecture and contracts in [DESIGN.md](DESIGN.md) govern implementation. 
 
 Milestone 1 (design) is recorded. Milestone 2 is the first proposed coding scope. Later milestones below describe the remaining delivery path; listing them does not authorize starting them automatically. At each boundary, report changes, actual test results, limitations, and remaining risks; recommend a checkpoint commit and wait for approval before the next milestone. Do not commit or push without explicit approval.
 
+The reviewed roadmap in [Milestones.md](Milestones.md) now supersedes this document's original combined milestones 3–5. It divides the remaining required work into milestones 3–7 and records optional extensions separately. Milestone 2 was committed as `91600a6`. Milestone 3 was subsequently authorized; its checkpoint below records the current work without authorizing milestone 4.
+
+### Milestone 3 checkpoint
+
+- Compose defaults to two worker replicas using the same image, with two handler slots per process.
+- `examples/parallel.json` demonstrates two branches and a join; README includes submission, status, and read-only attempt-inspection commands.
+- Three new integration tests exercise gated branches/joins, competing worker runtimes, and per-worker capacity. Six more PostgreSQL scenarios exercise lifecycle races and failure propagation.
+- Focused verification passed all nine new scenarios. Full clean verification passed 24 unit tests and 30 integration tests with no failures, errors, or skips.
+- The image built and isolated Compose startup passed with PostgreSQL, API, and two worker containers. HTTP checks completed sequential, parallel, and four-branch workflows; database records confirmed branch overlap, correct join ordering, one completed attempt per step, and two simultaneous branch claims per worker in the four-branch case.
+- No production Java behavior, public API, schema, or dependency changes were needed. The existing workflow guard and conditional ownership checks passed the added coverage.
+- Milestone 3 is complete. Recovery/connectivity behavior remains milestone 4, full retries/manual retry milestone 5, and listing/history APIs milestone 6. These have not been started.
+
 ### Milestone 2 checkpoint
 
 The proposed project tree is generated, with an additional shared integration-test support class to avoid duplicating PostgreSQL/HTTP setup. Maven dependencies and the official Maven Wrapper were downloaded. The implementation and run instructions are documented in [README.md](README.md), and [DESIGN.md](DESIGN.md) now distinguishes this slice from the complete target architecture.
