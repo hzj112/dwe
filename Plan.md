@@ -2,11 +2,29 @@
 
 ## Status and review boundary
 
-Prepared on 2026-10-17 (America/New_York) for review before application code generation, with environment results updated after Docker Desktop was started. Only this planning document has been created or updated in the repository. No application sources, project build configuration, migrations, or shell-profile changes have been generated. Disposable environment-check containers were run and removed as described below; pulled images remain cached for later use.
+Prepared on 2026-10-17 (America/New_York) for review before application code generation, with environment results updated after Docker Desktop was started. Milestone 2 was subsequently authorized and implemented. The environment-validation sections below preserve the observations made before implementation; the checkpoint records the newer project-specific results. No global shell-profile changes have been made.
 
 The architecture and contracts in [DESIGN.md](DESIGN.md) govern implementation. [PROJECT_DESCRIPTION.md](PROJECT_DESCRIPTION.md) defines the must-have scope, and [AGENTS.md](AGENTS.md) requires one approved milestone at a time. The original [assignment PDF](<Take Home Distributed Systems Exercise - athenahealth.pdf>) was reread, including its technical constraints and deliverables. `PROJECT_CONTEXT.md` is referenced in the instructions but is not currently present on disk; the existing description and approved design provide the implementation context.
 
 Milestone 1 (design) is recorded. Milestone 2 is the first proposed coding scope. Later milestones below describe the remaining delivery path; listing them does not authorize starting them automatically. At each boundary, report changes, actual test results, limitations, and remaining risks; recommend a checkpoint commit and wait for approval before the next milestone. Do not commit or push without explicit approval.
+
+### Milestone 2 checkpoint
+
+The proposed project tree is generated, with an additional shared integration-test support class to avoid duplicating PostgreSQL/HTTP setup. Maven dependencies and the official Maven Wrapper were downloaded. The implementation and run instructions are documented in [README.md](README.md), and [DESIGN.md](DESIGN.md) now distinguishes this slice from the complete target architecture.
+
+| Gate | Actual result |
+| --- | --- |
+| Clean Java 21 / Maven Wrapper build | `./mvnw -B -ntp clean verify` passed using the recorded Java 21 home. |
+| Unit tests | 24 passed; no failures, errors, or skips. |
+| PostgreSQL integration tests | 21 passed through Testcontainers against pinned PostgreSQL 18.6; no failures, errors, or skips. |
+| Database foundation | Fresh migration, repeated migration, submission rollback, relational/JSON constraints, conditional ownership, expired/stale write rejection, duplicate outcomes, supported backoff timestamp boundary, and failure propagation passed. |
+| Handler/runtime foundation | Sequential execution, isolated handler context, invalid-output rejection, and heartbeat renewal beyond the original lease passed. |
+| Submission schema | Extracted Draft 2020-12 schema validated; the sequential sample was accepted and five invalid structural payloads were rejected using a temporary external validator. |
+| Docker image | Shared API/worker image built successfully from pinned Java 21 JDK/JRE bases with Maven inside the build stage. |
+| Compose | Parsed successfully; exact `docker-compose` command started PostgreSQL, healthy API, and a running worker in an isolated verification project. Worker had no HTTP listener. |
+| HTTP/restart smoke test | Sample completed; execution detail, timestamps, attempt count, and final output remained identical after API/worker restart against the same database. |
+
+The sandbox denied some Docker/socket and dependency operations; the same operations passed with approved access outside it. Integration tests were not skipped to work around those restrictions. The isolated Compose verification containers and network were removed afterward, freeing the development ports; the final verification database volume is retained under project `dwe-m2-check`. These results complete milestone 2 only; milestones 3–5 have not been started. Expired-attempt recovery and the remaining APIs are explicitly incomplete. No commit has been made by the agent.
 
 ## Assignment and technology alignment
 
@@ -119,7 +137,7 @@ The initial slice is intentionally incomplete relative to the final submission: 
 
 ### Proposed milestone 2 file tree
 
-Filenames only; these files are not being generated now. Existing documentation is shown for orientation. Prefer direct implementations and focused records/classes; avoid introducing interfaces that merely wrap one implementation.
+Reviewed file structure for milestone 2, now generated. Existing documentation is shown for orientation. The implementation also adds `support/IntegrationTestSupport.java` to share integration-test setup. Prefer direct implementations and focused records/classes; avoid introducing interfaces that merely wrap one implementation.
 
 ```text
 dwe/
@@ -143,7 +161,7 @@ dwe/
 │   └── sequential.json
 └── src/
     ├── main/
-    │   ├── java/com/example/dwe/
+    │   ├── java/com/athenahealth/dwe/
     │   │   ├── WorkflowEngineApplication.java
     │   │   ├── api/
     │   │   │   ├── ExecutionController.java
@@ -189,7 +207,7 @@ dwe/
     │       └── db/migration/
     │           └── V1__create_workflow_schema.sql
     └── test/
-        ├── java/com/example/dwe/
+        ├── java/com/athenahealth/dwe/
         │   ├── service/
         │   │   └── WorkflowValidationServiceTest.java
         │   ├── handler/
@@ -233,7 +251,7 @@ dwe/
 │   ├── demo-restart-persistence.sh
 │   └── verify-local.sh
 └── src/
-    ├── main/java/com/example/dwe/
+    ├── main/java/com/athenahealth/dwe/
     │   ├── api/
     │   │   └── ExecutionHistoryController.java
     │   ├── service/
@@ -242,7 +260,7 @@ dwe/
     │   │   └── RecoveryCoordinator.java
     │   └── handler/demo/
     │       └── FailUntilAttemptHandler.java
-    └── test/java/com/example/dwe/
+    └── test/java/com/athenahealth/dwe/
         ├── domain/
         │   └── RetryPolicyTest.java
         └── integration/

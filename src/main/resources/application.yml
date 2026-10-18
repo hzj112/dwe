@@ -1,0 +1,36 @@
+spring:
+  application:
+    name: distributed-workflow-engine
+  profiles:
+    default: api
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${POSTGRES_DB:dwe}?connectTimeout=2&socketTimeout=2&tcpKeepAlive=true
+    username: ${POSTGRES_USER:dwe}
+    password: ${POSTGRES_PASSWORD:dwe_local}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:8}
+      minimum-idle: 2
+      connection-timeout: 2000
+      validation-timeout: 1000
+  flyway:
+    connect-retries: 5
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+engine:
+  lease-duration: 30s
+  heartbeat-interval: 5s
+  poll-interval: 1s
+  coordinator-interval: 1s
+  operation-timeout: 2s
+  safety-margin: 5s
+  shutdown-grace: 30s
+  worker-concurrency: 2
+  default-max-attempts: 3
+  default-backoff-initial-ms: 1000
+  default-backoff-max-ms: 30000

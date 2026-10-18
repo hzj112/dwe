@@ -1,0 +1,6 @@
+.git
+.idea
+.env
+target
+*.pdf
+**/.DS_Store

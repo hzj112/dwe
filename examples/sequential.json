@@ -1,0 +1,10 @@
+{
+  "definition": {
+    "steps": [
+      {"id": "start", "actionType": "ECHO", "parameters": {"message": "hello workflow"}},
+      {"id": "wait", "actionType": "DELAY", "parameters": {"durationMs": 1000}, "dependsOn": ["start"]},
+      {"id": "finish", "actionType": "ECHO", "dependsOn": ["wait"]}
+    ]
+  },
+  "inputs": {"reference": "sequential-demo"}
+}

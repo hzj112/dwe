@@ -1,2 +1,7 @@
 
 *.pdf
+target/
+.env
+.idea/
+*.iml
+.DS_Store

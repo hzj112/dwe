@@ -2,7 +2,17 @@
 
 ## Status and scope
 
-This document records the agreed architecture, handler contract, REST API and submission schema, persistence schema, execution lifecycle, database coordination behavior, worker operating defaults, and their rationale. It describes the intended system, not an implemented or verified system. Remaining implementation details and deferred capabilities are identified separately.
+This document records the agreed architecture, handler contract, REST API and submission schema, persistence schema, execution lifecycle, database coordination behavior, worker operating defaults, and their rationale. It describes the target system; the checkpoint below distinguishes implemented behavior from remaining work.
+
+## Implementation checkpoint: milestone 2
+
+The first implementation uses Java 21, Maven Wrapper 3.9.16, Spring Boot 4.1.1, Spring JDBC, Flyway, and PostgreSQL 18.6. The five-table schema below is applied by `V1__create_workflow_schema.sql`. API/coordinator and worker are separate profiles of one artifact, with the same startup-registered `ECHO` and `DELAY` handlers. The structural submission schema has been extracted to `src/main/resources/schemas/execution-submission.schema.json`.
+
+Implemented routes are submission, execution detail, and step detail. Submission preserves the original definition and persists effective configuration separately. The execution foundation includes dependency eligibility, workflow-guarded transactions, conditional claims and outcome writes, lifetime attempt fencing, step-only lease renewal, independent heartbeat/deadline executors, bounded handler capacity, and terminal outcome reconciliation. Basic retry and workflow-failure transitions are present so the foundation respects the state model; comprehensive failure/retry acceptance remains later work. `retryAllowed` reports state eligibility; the manual-retry endpoint is not yet implemented.
+
+Milestone 2 runs one worker process. Expired-attempt recovery is not implemented: an interrupted attempt remains `RUNNING` after expiry, although its stale renewals and reports are rejected. Parallel DAG and multi-worker/recovery coverage, complete automatic/manual retry scenarios, listing/history APIs, and delivery hardening remain the later milestones in [Plan.md](Plan.md). The target behavior in the rest of this document should not be read as a claim that those milestones are complete.
+
+Verification at this checkpoint: a clean Maven Wrapper build passed 24 unit tests and 21 integration tests against a real PostgreSQL Testcontainers database, without failures or skips. The shared Docker image built successfully; `docker-compose up` started an isolated PostgreSQL/API/worker stack, and the sequential sample completed through HTTP. After restarting both application containers against the same database, execution details and final step results were unchanged. The worker profile was also checked to have no HTTP listener. The extracted Draft 2020-12 schema and sequential sample passed a separate schema-validator check. See [README.md](README.md) for reproducible build and startup commands and current limitations.
 
 The initial implementation targets the must-have requirements in [PROJECT_DESCRIPTION.md](PROJECT_DESCRIPTION.md) and follows [AGENTS.md](AGENTS.md). Scalability influences component boundaries and concurrency guarantees from the start, while additional infrastructure and optimizations remain future work. `PROJECT_CONTEXT.md` was referenced in the project instructions but was not present on disk when this document was created.
 
@@ -241,7 +251,7 @@ The receipt represents the committed submission state, not a guarantee the execu
 
 ### Submission JSON Schema
 
-The following JSON Schema Draft 2020-12 defines the request body for `POST /api/v1/executions`. It is embedded here for review and can be extracted as a standalone schema during implementation. It does not define the response bodies or handler-specific business parameters. The `actionType` field is a nonblank string, not an enum, so registering another handler does not require changing the structural schema.
+The following JSON Schema Draft 2020-12 defines the request body for `POST /api/v1/executions`. It is embedded here for review and is also available in `src/main/resources/schemas/execution-submission.schema.json`. It does not define the response bodies or handler-specific business parameters. The `actionType` field is a nonblank string, not an enum, so registering another handler does not require changing the structural schema.
 
 ```json
 {
@@ -407,7 +417,7 @@ erDiagram
 
 ### Schema conventions
 
-The following is the target schema for implementation, not an applied migration. Columns are required unless marked nullable. Timestamps use PostgreSQL `TIMESTAMPTZ`, structured payloads use `JSONB`, and statuses use `TEXT` with allowed-value check constraints. Inputs, parameters, and successful outputs follow the JSON-object handler contract and the submission schema above. Creation and update timestamps use database time.
+The following logical schema is implemented by the initial Flyway migration. Columns are required unless marked nullable. Timestamps use PostgreSQL `TIMESTAMPTZ`, structured payloads use `JSONB`, and statuses use `TEXT` with allowed-value check constraints. Inputs, parameters, and successful outputs follow the JSON-object handler contract and the submission schema above. Creation and update timestamps use database time. Runtime and database validation additionally cap backoff at 9,000,000,000,000,000 milliseconds so conversion to PostgreSQL intervals and future eligibility timestamps stays within the supported finite range; accepting every positive `BIGINT` would overflow those timestamp operations. This is a storage-range check, separate from the normal 30,000 ms default cap.
 
 ### `workflow_execution`
 
@@ -850,7 +860,7 @@ Optional product capabilities remain deferred: cancellation, compensation, workf
 
 ## Remaining implementation details and deferred decisions
 
-The previously listed handler contract, retry defaults, API routes/payloads, coordination behavior, and worker operating defaults are recorded above. There are no remaining open items from that discussion list. The submission schema is part of the design contract; it is not an implemented API or a substitute for runtime semantic validation.
+The previously listed handler contract, retry defaults, API routes/payloads, coordination behavior, and worker operating defaults are recorded above. There are no remaining open items from that discussion list. The submission schema is part of the design contract; runtime semantic validation remains necessary. The checkpoint at the top identifies which API routes and behaviors are implemented.
 
 Implementation still needs concrete SQL and migrations, Java/dependency versions, framework/driver timeout settings, executor/connection sizing, opaque cursor encoding, predefined demo-handler implementations, and race-case verification. These are implementation tasks governed by the recorded behavior, not authorization to begin the next milestone or to select a different architecture implicitly.
 

@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:dwe:schema:execution-submission:v1",
+  "title": "Workflow execution submission",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "definition"
+  ],
+  "properties": {
+    "definition": {
+      "$ref": "#/$defs/definition"
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "$defs": {
+    "nonBlankString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "definition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "steps"
+      ],
+      "properties": {
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/step"
+          }
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "actionType"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nonBlankString"
+        },
+        "actionType": {
+          "$ref": "#/$defs/nonBlankString"
+        },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nonBlankString"
+          },
+          "uniqueItems": true,
+          "default": []
+        },
+        "retry": {
+          "$ref": "#/$defs/retry",
+          "default": {}
+        }
+      }
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3
+        },
+        "backoffInitialMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1000
+        },
+        "backoffMaxMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30000
+        }
+      }
+    }
+  }
+}

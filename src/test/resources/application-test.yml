@@ -1,0 +1,12 @@
+debug: false
+logging:
+  level:
+    root: INFO
+engine:
+  coordinator-enabled: false
+  lease-duration: 3s
+  heartbeat-interval: 200ms
+  poll-interval: 50ms
+  operation-timeout: 1s
+  safety-margin: 500ms
+  shutdown-grace: 5s
