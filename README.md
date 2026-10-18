@@ -2,11 +2,11 @@
 
 A Java 21 / Spring Boot application with PostgreSQL-backed workflow state and leased worker claims. Maven builds a single artifact that runs as either an API/coordinator or a worker process. The approved architecture is in [DESIGN.md](DESIGN.md); the current milestone breakdown is in [Milestones.md](Milestones.md), with earlier planning and environment checks in [Plan.md](Plan.md).
 
-## Current implementation: milestone 5
+## Current implementation: milestone 6
 
-This checkpoint implements validated submission, execution and step queries, manual workflow retry, Flyway-managed storage, handler registration, conditional claims, lease renewal, fencing, durable outcome reporting, sequential/parallel DAG execution, and expired-attempt recovery. Compose starts two worker containers by default, each with two handler slots. `ECHO`, `DELAY`, and `FAIL_UNTIL_ATTEMPT` are predefined demonstration handlers. API and workers run in separate containers using the same image.
+This checkpoint implements validated submission, paginated execution listing, execution/step queries, cycle/attempt history, manual workflow retry, Flyway-managed storage, handler registration, conditional claims, lease renewal, fencing, durable outcome reporting, sequential/parallel DAG execution, and expired-attempt recovery. Compose starts two worker containers by default, each with two handler slots. `ECHO`, `DELAY`, and `FAIL_UNTIL_ATTEMPT` are predefined demonstration handlers. API and workers run in separate containers using the same image.
 
-This is not the complete assignment. Recovery settles expired attempts as `ABANDONED` and schedules another attempt when the workflow is active and allowance remains. Expiry exhausting the allowance fails the workflow; expired siblings on already-failed workflows are settled without retry. Manual retry creates a fresh cycle after all attempts settle, preserving completed work and history. Listing/history APIs remain milestone 6, followed by final delivery verification in milestone 7.
+Recovery settles expired attempts as `ABANDONED` and schedules another attempt when the workflow is active and allowance remains. Expiry exhausting the allowance fails the workflow; expired siblings on already-failed workflows are settled without retry. Manual retry creates a fresh cycle after all attempts settle, preserving completed work and history. All agreed API routes are implemented; final delivery and fresh-checkout verification remain milestone 7.
 
 ## Prerequisites and build
 
@@ -72,7 +72,7 @@ flowchart LR
 
 The branches use `DELAY` for 3 and 5 seconds. They may run in the same worker or different workers; the join waits for both and returns their outputs under `dependencies`. Assignment is competitive rather than round-robin, so equal work distribution is not guaranteed. `docker-compose ps worker` shows both replicas, and `docker-compose logs worker` includes each process's worker ID.
 
-For timestamp/ownership inspection before the history API is implemented, this read-only query uses the default local database credentials:
+For direct database timestamp/ownership inspection, this read-only query uses the default local database credentials. The public attempt-history endpoint below exposes this information through HTTP as well:
 
 ```sh
 docker-compose exec -T postgres psql -U dwe -d dwe -c \
@@ -153,6 +153,44 @@ This uses the isolated Compose fixture from `verify-recovery.py`, builds a tempo
 
 Commands do not yet support HTTP idempotency keys. After an uncertain retry response, query the execution/cycle before repeating the POST. Repeating after a later cycle has already failed can start another cycle; durable command deduplication remains future work.
 
+## Listing and execution history
+
+All inspection routes read stored state without advancing workflows, renewing leases, or triggering retries:
+
+```sh
+curl --fail 'http://localhost:8080/api/v1/executions?status=FAILED&limit=10'
+curl --fail 'http://localhost:8080/api/v1/executions/EXECUTION_ID/cycles?limit=10'
+curl --fail 'http://localhost:8080/api/v1/executions/EXECUTION_ID/attempts?stepId=work&cycleNo=1&limit=10'
+```
+
+| Collection | Optional filters | Ordering |
+| --- | --- | --- |
+| Executions | Uppercase `status`: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED` | `createdAt` descending, execution UUID descending |
+| Cycles | None | `cycleNo` descending |
+| Attempts | Nonblank `stepId`, positive integer `cycleNo`, independently or together | `startedAt` descending, `stepId` ascending, lifetime `attemptNo` descending |
+
+Each response has `items` and `nextCursor`. `limit` defaults to 50 and accepts 1 through 200. A null `nextCursor` ends pagination. To continue, send the token unchanged with the same filters; the page size may change:
+
+```sh
+curl --fail --get 'http://localhost:8080/api/v1/executions' \
+  --data-urlencode 'status=FAILED' --data-urlencode 'limit=10' \
+  --data-urlencode 'cursor=NEXT_CURSOR_FROM_PREVIOUS_RESPONSE'
+```
+
+Execution summaries omit definitions and step details. Cycle history includes the failed step and terminal error. Attempt history includes worker identity, timestamps, stored result, and error; failed attempt errors include their recorded `retryable` classification. That classification does not imply allowance remains. `ABANDONED` attempts use `LEASE_EXPIRED` with null `retryable`; steps blocked by another failure have no synthetic attempt. Inspect their current step error (`WORKFLOW_FAILED`) and the cycle error for context. Reused completed steps have no attempt in the new cycle.
+
+Invalid limits, filters, or cursors return `400 INVALID_REQUEST`. Tokens are versioned and bound to their collection, execution, and filters; clients must treat them as opaque. They contain no authorization grant or cryptographic integrity guarantee. A missing execution returns 404 for nested history routes. An existing execution with no matching history returns an empty page, including an unknown step filter or a cycle with no attempts.
+
+Ordering uses immutable keys, including tie-breakers for identical timestamps. Each request reads a consistent database snapshot, but multiple pages do not share a frozen snapshot: new records or status changes may alter later results. Refresh the first page for current state. `retryAllowed` remains advisory; the retry command checks eligibility again in its own transaction.
+
+Run the portable image-build and history API checks with:
+
+```sh
+python3 scripts/verify-history.py
+```
+
+This uses the recovery script's isolated Compose fixture, verifies failed execution listing, paginated cycles/attempts, retained history after manual retry, and filter errors, then removes its own temporary resources. It requires Python 3 and Docker Compose, with no additional Python packages.
+
 ## Local Java processes
 
 Start only the database, package the application, and run the roles in separate terminals:
@@ -188,7 +226,8 @@ No authentication, external-code execution, recurring schedules, cancellation AP
 - Milestone 3 integration tests: gated parallel branches and join outputs, two real worker runtimes competing for one step, per-worker capacity with excess work left unclaimed, failure racing with claims/completion in both transaction orders, failure of waiting retry steps, and conflicting concurrent outcome reports. Lock-race tests observe PostgreSQL's blocking sessions to establish ordering rather than relying on sleeps.
 - Milestone 4 tests: abandonment/backoff and allowance exhaustion, failed-workflow cleanup, competing recovery passes, heartbeat/recovery races, expiry after lock waits, stale-result rejection, lost claim/result responses, pre-commit write failure, transient renewal failure, graceful draining, and handlers that ignore interruption. Local deadline tests inject renewal responses; PostgreSQL integration tests verify durable ownership and history independently.
 - Milestone 5 tests: handler parameter validation and durable identity, real-worker automatic retries, persisted doubling/capped backoff, permanent and unexpected failures, new-cycle allowances, completed-output reuse, immutable history, running-attempt conflicts, concurrent retry requests, request validation, stale reports across cycles, and rollback of a partially applied retry command.
+- Milestone 6 tests: cursor format/binding, HTTP listing and history, all workflow statuses, microsecond timestamp ties, UUID/step/attempt ordering, multi-cycle pagination, filters and errors, bounded page sizes, preserved results/classifications, and all-table comparisons proving reads do not mutate stored state.
 - Container smoke test: build the shared image, start API/worker/PostgreSQL with the assignment's `docker-compose` command, submit the sample through HTTP, and verify stored results after application restart.
 - Portable container recovery verification: `scripts/verify-recovery.py` exercises actual process death, worker network isolation, and PostgreSQL unavailability using disposable infrastructure.
 
-Maven reports are under `target/surefire-reports` and `target/failsafe-reports`. Run milestone 3 integration tests with `./mvnw -Dit.test=ParallelWorkflowIT,WorkflowConcurrencyIT verify`, milestone 4 with `./mvnw -Dit.test=LeaseRecoveryIT,WorkerFailureIT verify`, or milestone 5 with `./mvnw -Dit.test=AutomaticRetryIT,ManualRetryIT verify`. These commands also run unit tests. The milestone 5 clean checkpoint passed 42 unit tests and 70 integration tests without failures or skips. Later milestones add listing/history APIs and final delivery verification.
+Maven reports are under `target/surefire-reports` and `target/failsafe-reports`. Run milestone 3 integration tests with `./mvnw -Dit.test=ParallelWorkflowIT,WorkflowConcurrencyIT verify`, milestone 4 with `./mvnw -Dit.test=LeaseRecoveryIT,WorkerFailureIT verify`, milestone 5 with `./mvnw -Dit.test=AutomaticRetryIT,ManualRetryIT verify`, or milestone 6 with `./mvnw -Dit.test=ExecutionHistoryIT verify`. These commands also run unit tests. The milestone 6 clean checkpoint passed 56 unit tests and 107 integration tests without failures or skips. Final delivery verification remains milestone 7.

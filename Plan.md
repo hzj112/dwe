@@ -33,13 +33,23 @@ Milestone 3 was committed as `1136fc8`. Milestone 4 was subsequently authorized,
 
 ### Milestone 5 checkpoint
 
-Milestone 4 was committed as `457e0ec`. Milestone 5 was subsequently authorized and implemented; these changes remain uncommitted for review.
+Milestone 4 was committed as `457e0ec`. Milestone 5 was subsequently authorized, implemented, verified, and committed as `8bd788e`.
 
 - Added stateless `FAIL_UNTIL_ATTEMPT` handler with validated failure count and optional permanent-error classification, using persisted lifetime attempt numbers.
 - Added the manual-retry service, `POST /api/v1/executions/{id}/retry`, stable conflict responses, and atomic new-cycle creation under the existing workflow guard. Completed outputs, policies, original configuration, earlier history, and lifetime counters are preserved.
 - Added automatic-retry and manual-retry integration tests, a handler unit test, and a small shared worker test harness. Focused verification passed 23 new PostgreSQL scenarios; full clean verification passed 42 unit tests and 70 integration tests without failures, errors, or skips.
 - Added automatic, manual, and permanent-failure examples plus commented `scripts/verify-retries.py`, reusing the isolated recovery-check fixture. Image build and container checks passed for all examples and actual API/worker restart during a persisted backoff; temporary resources were cleaned up.
 - The five-table schema and dependencies remain unchanged. Listing/history APIs remain milestone 6 and final delivery milestone 7; neither has started.
+
+### Milestone 6 checkpoint
+
+Milestone 5 was committed as `8bd788e`. Milestone 6 was subsequently authorized, implemented, and verified; changes remain uncommitted for review.
+
+- Added execution listing and cycle/attempt history routes, DTOs, read-only persistence queries, and versioned resource/filter-bound continuation tokens.
+- Kept the existing schema, indexes, dependencies, and execution behavior. Each request reads a consistent snapshot; separate pages are not a frozen history snapshot.
+- Added 14 cursor unit cases and 37 PostgreSQL/HTTP scenarios for pagination, timestamp ties, filters, errors, multi-cycle records, and unchanged stored state. Full clean verification passed 56 unit tests and 107 integration tests without failures, errors, or skips.
+- Added commented `scripts/verify-history.py` using the isolated Compose fixture. Image build and public API checks passed, including preserved prior history after manual retry; temporary resources were cleaned up.
+- Updated README and DESIGN with usage, pagination semantics, rationale, and limitations. Milestone 7 final delivery verification has not started.
 
 ### Milestone 2 checkpoint
 

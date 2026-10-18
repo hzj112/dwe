@@ -5,6 +5,7 @@ import com.athenahealth.dwe.handler.HandlerRegistry;
 import com.athenahealth.dwe.handler.StepContext;
 import com.athenahealth.dwe.handler.demo.EchoHandler;
 import com.athenahealth.dwe.persistence.WorkflowQueries;
+import com.athenahealth.dwe.persistence.PageCursor;
 import com.athenahealth.dwe.worker.*;
 import com.athenahealth.dwe.support.IntegrationTestSupport;
 
@@ -34,7 +35,7 @@ class SequentialWorkflowIT extends IntegrationTestSupport {
                 });
             } finally { worker.stop(); }
         }
-        var restartedQueries = new WorkflowQueries(jdbc, json);
+        var restartedQueries = new WorkflowQueries(jdbc, json, new PageCursor(json));
         assertThat(restartedQueries.step(id, "c").output().get("dependencies").propertyNames()).containsExactly("b");
         assertThat(restartedQueries.step(id, "c").output().get("dependencies").get("b").get("durationMs").intValue()).isEqualTo(30);
         assertThat(jdbc.queryForObject("SELECT count(*) FROM step_attempt WHERE workflow_id = ? AND status = 'COMPLETED'", Integer.class, id)).isEqualTo(3);

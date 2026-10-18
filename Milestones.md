@@ -48,7 +48,7 @@ Use controlled PostgreSQL race tests and container-level crash/partition tests; 
 
 ### Milestone 5 — Complete retries and manual workflow retry
 
-**Implementation checkpoint:** Authorized and implemented; changes remain uncommitted for review. Clean verification passed 42 unit tests and 70 PostgreSQL integration tests with no failures or skips. The registered `FAIL_UNTIL_ATTEMPT` handler and retry endpoint demonstrate automatic success, permanent failure, and new-cycle manual resumption. Tests cover backoff, allowances, preserved outputs/history, concurrency, validation, and rollback. The image built and portable container checks passed, including actual API/worker restart during backoff. No new schema or dependencies were needed. Milestone 6 has not started.
+**Implementation checkpoint:** Authorized, implemented, verified, and committed as `8bd788e`. Clean verification passed 42 unit tests and 70 PostgreSQL integration tests with no failures or skips. The registered `FAIL_UNTIL_ATTEMPT` handler and retry endpoint demonstrate automatic success, permanent failure, and new-cycle manual resumption. Tests cover backoff, allowances, preserved outputs/history, concurrency, validation, and rollback. The image built and portable container checks passed, including actual API/worker restart during backoff. No new schema or dependencies were needed. Subsequent milestone 6 work is recorded below.
 
 **Outcome:** Users can recover failed workflows while preserving completed work and history.
 
@@ -61,6 +61,8 @@ Use controlled PostgreSQL race tests and container-level crash/partition tests; 
 **Acceptance:** A workflow can fail, be manually retried, and complete without rerunning successful predecessors. Concurrent retry requests create only one new cycle. Active attempts block retry with the agreed `409` response.
 
 ### Milestone 6 — Listing and execution history APIs
+
+**Implementation checkpoint:** Authorized, implemented, and verified; changes remain uncommitted for review. All three read routes below use bounded pages, stable keyset ordering, and resource/filter-bound versioned cursors. Read-only queries expose existing state without modifying lifecycle or ownership. Clean verification passed 56 unit tests and 107 PostgreSQL integration tests without failures or skips, including 14 new cursor cases and 37 new API scenarios. The Docker image built and `scripts/verify-history.py` passed paginated history, listing, retained prior cycles/results after manual retry, filters, and error checks in a disposable stack. No schema or dependency changes were needed. Milestone 7 has not started.
 
 **Outcome:** Users can inspect executions and understand failures through the API.
 

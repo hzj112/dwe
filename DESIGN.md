@@ -44,6 +44,18 @@ Clean Maven verification passed 42 unit tests and 70 PostgreSQL integration test
 
 `scripts/verify-retries.py` reuses the disposable Compose fixture from the recovery checks. Its image build and HTTP/database checks passed automatic retry, manual resumption, permanent failure with explicit manual retry, and a real API/worker stop/start while backoff was persisted. Earlier cycle/attempt rows and completed predecessor output remained unchanged. The script removed only its own temporary resources. Listing and cycle/attempt history APIs remain milestone 6, and final delivery remains milestone 7; neither has started.
 
+## Implementation checkpoint: milestone 6
+
+The three remaining read routes are implemented: execution listing with optional uppercase `status`, cycle history, and attempt history with optional `stepId` and positive `cycleNo`. Responses follow the summary/history fields below and the `items`/`nextCursor` envelope. Page size defaults to 50 and is bounded to 1–200. Unknown parent executions return 404; existing executions with no matching history return empty pages. Reported failure classification, abandonment, preserved results, and cycles remain distinguishable; steps that never acquired work have no synthetic attempt.
+
+`WorkflowQueries` performs read-only queries using repeatable-read transactions, with no lifecycle updates, claims, or ownership renewal. The existing five-table schema and indexes support the routes without migrations or new dependencies. Listing uses one bounded query with summary counts, avoiding an application query per execution. Query parameters and continuation values are bound SQL parameters.
+
+`PageCursor` issues versioned URL-safe Base64 JSON tokens containing the collection/execution, normalized filters, and immutable ordering position. Decoding validates the canonical format and binding. Tokens are opaque client continuation values, not signed credentials or an authorization mechanism; no server-side cursor sessions or signing-secret lifecycle is introduced. Page size is independent of binding and may change between requests. A limit-plus-one query detects whether another page exists. Timestamp ties use the agreed UUID or step/attempt tie-breakers, with mixed-direction comparisons for attempt ordering. Each request has a consistent snapshot; pages across requests do not share one snapshot, and mutable filters may change membership.
+
+Clean Maven verification passed 56 unit tests and 107 PostgreSQL integration tests without failures, errors, or skips. Fourteen new cursor unit cases and 37 new HTTP/database scenarios cover ordering ties, filters, defaults/limits, cross-resource/filter cursor rejection, multi-cycle history, saved results, errors, and all-table comparisons proving inspection does not mutate persisted rows. An initial sandbox-restricted run could not initialize Mockito's attachment support; rerunning with the required process/Docker access passed. No tests were skipped or weakened.
+
+`scripts/verify-history.py` built the image and disposable Compose stack, then passed failed execution listing, paginated failures, cycle ordering, immutable history after manual retry, reused predecessor output, filtering, and invalid-filter errors. It cleaned up its own temporary resources. Milestone 6 changes remain uncommitted for review. Final delivery and fresh-checkout verification remain milestone 7, which has not started.
+
 ## Goals
 
 - Execute DAG workflows with sequential dependencies, concurrent independent branches, and joins.
@@ -892,9 +904,9 @@ Optional product capabilities remain deferred: cancellation, compensation, workf
 
 ## Remaining implementation details and deferred decisions
 
-The previously listed handler contract, retry defaults, API routes/payloads, coordination behavior, and worker operating defaults are recorded above. There are no remaining open items from that discussion list. The submission schema is part of the design contract; runtime semantic validation remains necessary. The checkpoint at the top identifies which API routes and behaviors are implemented.
+The previously listed handler contract, retry defaults, API routes/payloads, coordination behavior, and worker operating defaults are recorded above. There are no remaining open items from that discussion list. The submission schema is part of the design contract; runtime semantic validation remains necessary. The latest checkpoint identifies which API routes and behaviors are implemented.
 
-The SQL migration, Java/dependency versions, initial timeout and capacity settings, predefined ECHO/DELAY/FAIL_UNTIL_ATTEMPT handlers, and milestone 2–5 execution/recovery/retry coverage are implemented as described in the checkpoints. Remaining work includes opaque history cursors, listing/cycle/attempt APIs, and final delivery verification. These are implementation tasks governed by the recorded behavior and Milestones.md, not authorization to begin the next milestone or to select a different architecture implicitly.
+The SQL migration, Java/dependency versions, initial timeout and capacity settings, predefined ECHO/DELAY/FAIL_UNTIL_ATTEMPT handlers, and milestone 2–6 execution/recovery/retry/API coverage are implemented as described in the checkpoints. All agreed API routes and opaque history cursors are implemented. Final delivery verification remains milestone 7. This work is governed by the recorded behavior and Milestones.md, not authorization to begin the next milestone or to select a different architecture implicitly.
 
 Arbitrary execution without predefined registration, reusable definitions/schedules, workflow-code versioning, and HTTP idempotency keys remain deferred capabilities with the trade-offs recorded above. Design their execution and compatibility semantics before introducing them.
 

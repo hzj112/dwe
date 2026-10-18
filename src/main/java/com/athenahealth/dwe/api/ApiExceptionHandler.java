@@ -22,6 +22,7 @@ import com.athenahealth.dwe.api.ExecutionDtos.ErrorEnvelope;
 import com.athenahealth.dwe.persistence.WorkflowQueries.ResourceNotFoundException;
 import com.athenahealth.dwe.service.WorkflowValidationService.InvalidWorkflowException;
 import com.athenahealth.dwe.persistence.WorkflowStore.RetryConflictException;
+import com.athenahealth.dwe.persistence.PageCursor.InvalidQueryException;
 
 /** Converts exceptions from API requests into consistent HTTP statuses and JSON error responses. */
 @RestControllerAdvice
@@ -37,6 +38,12 @@ public class ApiExceptionHandler {
     @ExceptionHandler({HttpMessageNotReadableException.class, MethodArgumentTypeMismatchException.class})
     ResponseEntity<ErrorEnvelope> malformed(Exception e) {
         return error(HttpStatus.BAD_REQUEST, "INVALID_REQUEST", "Malformed JSON or invalid request field");
+    }
+
+    /** Pagination and filter errors keep the shared envelope and explain what the client must correct. */
+    @ExceptionHandler(InvalidQueryException.class)
+    ResponseEntity<ErrorEnvelope> invalidQuery(InvalidQueryException e) {
+        return error(HttpStatus.BAD_REQUEST, "INVALID_REQUEST", e.getMessage());
     }
 
     @ExceptionHandler(ResourceNotFoundException.class)

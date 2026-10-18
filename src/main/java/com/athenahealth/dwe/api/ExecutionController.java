@@ -11,13 +11,19 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.athenahealth.dwe.api.ExecutionDtos.ExecutionDetail;
 import com.athenahealth.dwe.api.ExecutionDtos.ExecutionReceipt;
 import com.athenahealth.dwe.api.ExecutionDtos.StepDetail;
 import com.athenahealth.dwe.api.ExecutionDtos.SubmissionRequest;
+import com.athenahealth.dwe.api.ExecutionDtos.Page;
+import com.athenahealth.dwe.api.ExecutionDtos.ExecutionSummary;
+import com.athenahealth.dwe.api.ExecutionDtos.CycleItem;
+import com.athenahealth.dwe.api.ExecutionDtos.AttemptItem;
 import com.athenahealth.dwe.persistence.WorkflowQueries;
+import com.athenahealth.dwe.persistence.PageCursor.InvalidQueryException;
 import com.athenahealth.dwe.service.WorkflowSubmissionService;
 import com.athenahealth.dwe.service.WorkflowRetryService;
 
@@ -47,6 +53,37 @@ public class ExecutionController {
     @GetMapping("/{id}")
     public ExecutionDetail execution(@PathVariable UUID id) {
         return queries.execution(id);
+    }
+
+    /** Lists summaries in creation order; continuation tokens retain the selected status filter. */
+    @GetMapping
+    public Page<ExecutionSummary> executions(@RequestParam(required = false) String status,
+                                             @RequestParam(defaultValue = "50") int limit,
+                                             @RequestParam(required = false) String cursor) {
+        return queries.executions(status, limit, cursor);
+    }
+
+    /** Exposes the initial run and subsequent manual retries without changing their state. */
+    @GetMapping("/{id}/cycles")
+    public Page<CycleItem> cycles(@PathVariable UUID id, @RequestParam(defaultValue = "50") int limit,
+                                  @RequestParam(required = false) String cursor) {
+        return queries.cycles(id, limit, cursor);
+    }
+
+    /** Exposes claimed attempts, optionally restricted to one step and/or cycle. */
+    @GetMapping("/{id}/attempts")
+    public Page<AttemptItem> attempts(@PathVariable UUID id, @RequestParam(required = false) String stepId,
+                                     @RequestParam(required = false) String cycleNo,
+                                     @RequestParam(defaultValue = "50") int limit,
+                                     @RequestParam(required = false) String cursor) {
+        return queries.attempts(id, stepId, parseCycle(cycleNo), limit, cursor);
+    }
+
+    /** Explicitly supplied empty filters are invalid, rather than silently meaning all cycles. */
+    private static Integer parseCycle(String cycleNo) {
+        if (cycleNo == null) return null;
+        try { return Integer.valueOf(cycleNo); }
+        catch (NumberFormatException e) { throw new InvalidQueryException("cycleNo must be a positive integer"); }
     }
 
     /** Returns one step's configuration, attempt counts, output, and latest error. */

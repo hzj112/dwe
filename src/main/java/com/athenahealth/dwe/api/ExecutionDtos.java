@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.UUID;
 
 import com.athenahealth.dwe.domain.RetryPolicy;
+import com.athenahealth.dwe.domain.AttemptStatus;
 import com.athenahealth.dwe.domain.StepStatus;
 import com.athenahealth.dwe.domain.WorkflowStatus;
 import com.athenahealth.dwe.service.WorkflowValidationService.Violation;
@@ -22,6 +23,19 @@ public final class ExecutionDtos {
     /** A stored workflow or step failure, rather than an HTTP request error. */
     public record ResourceError(String code, String message) { }
     public record StepSummary(String stepId, StepStatus status) { }
+    /** A bounded collection; clients pass nextCursor unchanged to continue with the same filters. */
+    public record Page<T>(List<T> items, String nextCursor) { }
+    public record ExecutionSummary(UUID executionId, WorkflowStatus status, int currentCycleNo,
+                                   Instant createdAt, Instant firstStartedAt, Instant finishedAt,
+                                   int runningStepCount, boolean retryAllowed) { }
+    /** One initial run or manual-retry cycle, including the error that ended that cycle. */
+    public record CycleItem(int cycleNo, WorkflowStatus status, Instant createdAt, Instant startedAt,
+                            Instant finishedAt, String failedStepId, ResourceError error) { }
+    /** Retryable describes a reported failure's classification, independently of remaining allowance. */
+    public record AttemptError(String code, String message, Boolean retryable) { }
+    public record AttemptItem(String stepId, int cycleNo, long attemptNo, String workerId,
+                              AttemptStatus status, Instant startedAt, Instant finishedAt,
+                              JsonNode result, AttemptError error) { }
     /** Execution status view; retryAllowed is advisory because the retry transaction rechecks eligibility. */
     public record ExecutionDetail(UUID executionId, WorkflowStatus status, int currentCycleNo,
                                   Instant createdAt, Instant firstStartedAt, Instant finishedAt,
