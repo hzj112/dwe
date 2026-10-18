@@ -1,0 +1,10 @@
+{
+  "definition": {
+    "steps": [
+      {"id": "work", "actionType": "FAIL_UNTIL_ATTEMPT", "parameters": {"failAttempts": 1, "retryable": false},
+       "retry": {"maxAttempts": 3}},
+      {"id": "finish", "actionType": "ECHO", "dependsOn": ["work"]}
+    ]
+  },
+  "inputs": {"reference": "permanent-failure-demo"}
+}

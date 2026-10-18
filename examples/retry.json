@@ -1,0 +1,11 @@
+{
+  "definition": {
+    "steps": [
+      {"id": "start", "actionType": "ECHO", "parameters": {"message": "automatic retry"}},
+      {"id": "work", "actionType": "FAIL_UNTIL_ATTEMPT", "parameters": {"failAttempts": 2},
+       "dependsOn": ["start"], "retry": {"maxAttempts": 3, "backoffInitialMs": 300, "backoffMaxMs": 600}},
+      {"id": "finish", "actionType": "ECHO", "dependsOn": ["work"]}
+    ]
+  },
+  "inputs": {"reference": "automatic-retry-demo"}
+}

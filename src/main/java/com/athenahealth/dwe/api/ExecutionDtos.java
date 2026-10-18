@@ -22,7 +22,7 @@ public final class ExecutionDtos {
     /** A stored workflow or step failure, rather than an HTTP request error. */
     public record ResourceError(String code, String message) { }
     public record StepSummary(String stepId, StepStatus status) { }
-    /** Execution status view; retryAllowed describes state eligibility, ahead of the future retry endpoint. */
+    /** Execution status view; retryAllowed is advisory because the retry transaction rechecks eligibility. */
     public record ExecutionDetail(UUID executionId, WorkflowStatus status, int currentCycleNo,
                                   Instant createdAt, Instant firstStartedAt, Instant finishedAt,
                                   int runningStepCount, boolean retryAllowed, JsonNode definition,

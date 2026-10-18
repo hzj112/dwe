@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-This document records the agreed architecture, handler contract, REST API and submission schema, persistence schema, execution lifecycle, database coordination behavior, worker operating defaults, and their rationale. It describes the target system; the checkpoint below distinguishes implemented behavior from remaining work.
+This document records the agreed architecture, handler contract, REST API and submission schema, persistence schema, execution lifecycle, database coordination behavior, worker operating defaults, and their rationale. It describes the target system; checkpoints are historical, with the latest checkpoint identifying current verified behavior and remaining work.
 
 ## Implementation checkpoint: milestone 2
 
@@ -33,6 +33,16 @@ Clean Maven verification passed 29 unit tests and 47 PostgreSQL integration test
 The portable `scripts/verify-recovery.py` built an isolated image/Compose stack and passed three actual fault scenarios: worker process death, worker/database network isolation, and a full PostgreSQL pause. Each execution recorded attempt 1 as `ABANDONED`, attempt 2 as `COMPLETED` after backoff, and successful downstream execution. The process-death and partition cases used a different replacement worker. Its temporary configuration uses a 5-second lease; production defaults remain the 30-second lease and 5-second scan. The script removes only its own unique project's containers, network, volume, and image. Milestone 5 and subsequent work have not started.
 
 The initial implementation targets the must-have requirements in [PROJECT_DESCRIPTION.md](PROJECT_DESCRIPTION.md) and follows [AGENTS.md](AGENTS.md). Scalability influences component boundaries and concurrency guarantees from the start, while additional infrastructure and optimizations remain future work. `PROJECT_CONTEXT.md` was referenced in the project instructions but was not present on disk when this document was created.
+
+## Implementation checkpoint: milestone 5
+
+Manual retry is implemented at `POST /api/v1/executions/{id}/retry` through `WorkflowRetryService` and the transactional `WorkflowStore.retry` operation. Under the workflow guard, it requires a failed execution and no running step or attempt records, creates the next pending cycle, resets failed steps, and clears the current finish timestamp. Completed outputs, original definition/inputs, effective policies, first-start timestamp, all previous cycles/attempts, and lifetime fencing counters remain intact. Retry allowances and backoff restart within the new cycle. Rejections use the agreed 400/404/409 error contract, including rejection of any nonempty body. No migration or new dependency was needed.
+
+The startup registry now includes the stateless `FAIL_UNTIL_ATTEMPT` demonstration handler. It requires a nonnegative long integer `failAttempts` and accepts optional boolean `retryable` (default true). It raises `DEMO_FAILURE` while the durable lifetime attempt number is at most the threshold. Success returns `attemptNo`, `cycleNo`, and the stable logical `idempotencyKey`. A new handler object or worker restart cannot reset its failure count. Changing action-specific behavior did not require business-specific branches in orchestration.
+
+Clean Maven verification passed 42 unit tests and 70 PostgreSQL integration tests without failures, errors, or skips. The 23 new PostgreSQL scenarios cover automatic success, backoff doubling/capping without early claims, component reinitialization retaining schedules, permanent/unexpected errors, new-cycle budgets, immutable prior history, reused outputs, stale reports across cycles, running-attempt conflicts, simultaneous retry requests, request validation, and rollback after an injected failure late in the retry transaction.
+
+`scripts/verify-retries.py` reuses the disposable Compose fixture from the recovery checks. Its image build and HTTP/database checks passed automatic retry, manual resumption, permanent failure with explicit manual retry, and a real API/worker stop/start while backoff was persisted. Earlier cycle/attempt rows and completed predecessor output remained unchanged. The script removed only its own temporary resources. Listing and cycle/attempt history APIs remain milestone 6, and final delivery remains milestone 7; neither has started.
 
 ## Goals
 
@@ -166,7 +176,7 @@ public interface StepHandler {
 
 The context exposes no persistence repository, claim operation, heartbeat operation, or workflow-state setter. Claims, renewals, reporting, retries, and cancellation signaling belong to the worker runtime and shared engine services.
 
-Workflow inputs, step parameters, and successful outputs are JSON objects. Use `{}` when no data is needed; a Java null or non-object output violates the handler contract and is treated as a permanent `INVALID_HANDLER_OUTPUT` failure. Each invocation receives isolated input data so mutation cannot change another invocation or persisted configuration. Handlers must be stateless or safe for concurrent invocation.
+Workflow inputs, step parameters, and successful outputs are JSON objects. Use `{}` when no data is needed; a Java null or non-object output violates the handler contract and is treated as a permanent `INVALID_OUTPUT` failure. Each invocation receives isolated input data so mutation cannot change another invocation or persisted configuration. Handlers must be stateless or safe for concurrent invocation.
 
 Expose only direct dependency outputs. Access to another step's result requires declaring that dependency. There is no input-expression language or placeholder substitution initially; handlers explicitly read their parameters, workflow inputs, and dependency outputs.
 
@@ -884,7 +894,7 @@ Optional product capabilities remain deferred: cancellation, compensation, workf
 
 The previously listed handler contract, retry defaults, API routes/payloads, coordination behavior, and worker operating defaults are recorded above. There are no remaining open items from that discussion list. The submission schema is part of the design contract; runtime semantic validation remains necessary. The checkpoint at the top identifies which API routes and behaviors are implemented.
 
-The SQL migration, Java/dependency versions, initial timeout and capacity settings, predefined ECHO/DELAY handlers, and milestone 2–4 execution/recovery coverage are implemented as described in the checkpoints. Remaining work includes complete retry/manual-retry acceptance, opaque history cursors and the remaining APIs, and final delivery verification. These are implementation tasks governed by the recorded behavior and Milestones.md, not authorization to begin the next milestone or to select a different architecture implicitly.
+The SQL migration, Java/dependency versions, initial timeout and capacity settings, predefined ECHO/DELAY/FAIL_UNTIL_ATTEMPT handlers, and milestone 2–5 execution/recovery/retry coverage are implemented as described in the checkpoints. Remaining work includes opaque history cursors, listing/cycle/attempt APIs, and final delivery verification. These are implementation tasks governed by the recorded behavior and Milestones.md, not authorization to begin the next milestone or to select a different architecture implicitly.
 
 Arbitrary execution without predefined registration, reusable definitions/schedules, workflow-code versioning, and HTTP idempotency keys remain deferred capabilities with the trade-offs recorded above. Design their execution and compatibility semantics before introducing them.
 

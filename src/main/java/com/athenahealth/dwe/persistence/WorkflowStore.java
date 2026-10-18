@@ -21,6 +21,7 @@ import com.athenahealth.dwe.domain.RetryPolicy;
 import com.athenahealth.dwe.domain.StepClaim;
 import com.athenahealth.dwe.domain.StepDefinition;
 import com.athenahealth.dwe.service.WorkflowValidationService.ValidatedSubmission;
+import com.athenahealth.dwe.persistence.WorkflowQueries.ResourceNotFoundException;
 
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
@@ -51,6 +52,12 @@ public class WorkflowStore {
 
     /** Whether a report is recognized, plus its stored attempt outcome; duplicate reports return that outcome. */
     public record ReportResult(boolean accepted, AttemptStatus status) { }
+    /** Explains a state conflict without treating a rejected retry command as a database failure. */
+    public static final class RetryConflictException extends RuntimeException {
+        private final String code;
+        public RetryConflictException(String code, String message) { super(message); this.code = code; }
+        public String code() { return code; }
+    }
     private record Candidate(UUID executionId, String stepId) { }
     private record ExpiredCandidate(UUID executionId, String stepId, long attemptNo, int cycleNo, String workerId) { }
     private record WorkflowRow(String status, int cycleNo, JsonNode inputs) {
@@ -83,6 +90,40 @@ public class WorkflowStore {
                 }
             }
             return id;
+        });
+    }
+
+    /**
+     * Reopens a failed execution in a new cycle, retaining completed outputs and all historical records.
+     * The workflow guard serializes retry with claims, recovery, and other retry requests.
+     */
+    public int retry(UUID executionId) {
+        return inTransaction(() -> {
+            WorkflowRow previous = workflow(executionId, false)
+                    .orElseThrow(() -> new ResourceNotFoundException("Execution not found"));
+            if (!previous.status().equals("FAILED")) {
+                throw new RetryConflictException("WORKFLOW_NOT_FAILED", "Only a failed execution can be retried");
+            }
+            boolean unfinished = Boolean.TRUE.equals(jdbc.queryForObject("""
+                    SELECT EXISTS (SELECT 1 FROM step_attempt WHERE workflow_id = ? AND status = 'RUNNING')
+                        OR EXISTS (SELECT 1 FROM step_execution WHERE workflow_id = ? AND status = 'RUNNING')
+                    """, Boolean.class, executionId, executionId));
+            // An expired lease is still unfinished until recovery records its terminal abandonment.
+            if (unfinished) throw new RetryConflictException("RUNNING_ATTEMPTS_REMAIN", "Running attempts must settle before retry");
+            int nextCycle = Math.incrementExact(previous.cycleNo());
+            jdbc.update("INSERT INTO workflow_cycle(workflow_id, cycle_no, status) VALUES (?, ?, 'PENDING')",
+                    executionId, nextCycle);
+            jdbc.update("""
+                    UPDATE step_execution SET status = 'PENDING', eligible_at = NULL, error_code = NULL,
+                        error_message = NULL, updated_at = clock_timestamp()
+                    WHERE workflow_id = ? AND status = 'FAILED'
+                    """, executionId);
+            // Keep policies, definition, inputs, first-start time, and lifetime fencing counters unchanged.
+            jdbc.update("""
+                    UPDATE workflow_execution SET status = 'PENDING', current_cycle_no = ?, finished_at = NULL,
+                        updated_at = clock_timestamp() WHERE id = ?
+                    """, nextCycle, executionId);
+            return nextCycle;
         });
     }
 

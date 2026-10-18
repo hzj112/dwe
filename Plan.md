@@ -31,6 +31,16 @@ Milestone 3 was committed as `1136fc8`. Milestone 4 was subsequently authorized,
 - Added `examples/recovery.json` and the portable, commented `scripts/verify-recovery.py`. It built the image and isolated two-worker stack, then passed actual worker-kill, worker-partition, and database-pause checks with durable replacement and backoff evidence. Its own disposable containers, network, volume, and image were cleaned up.
 - No schema or public API changes were required. Complete retry/manual-retry acceptance remains milestone 5, listing/history APIs milestone 6, and final delivery milestone 7; none has started.
 
+### Milestone 5 checkpoint
+
+Milestone 4 was committed as `457e0ec`. Milestone 5 was subsequently authorized and implemented; these changes remain uncommitted for review.
+
+- Added stateless `FAIL_UNTIL_ATTEMPT` handler with validated failure count and optional permanent-error classification, using persisted lifetime attempt numbers.
+- Added the manual-retry service, `POST /api/v1/executions/{id}/retry`, stable conflict responses, and atomic new-cycle creation under the existing workflow guard. Completed outputs, policies, original configuration, earlier history, and lifetime counters are preserved.
+- Added automatic-retry and manual-retry integration tests, a handler unit test, and a small shared worker test harness. Focused verification passed 23 new PostgreSQL scenarios; full clean verification passed 42 unit tests and 70 integration tests without failures, errors, or skips.
+- Added automatic, manual, and permanent-failure examples plus commented `scripts/verify-retries.py`, reusing the isolated recovery-check fixture. Image build and container checks passed for all examples and actual API/worker restart during a persisted backoff; temporary resources were cleaned up.
+- The five-table schema and dependencies remain unchanged. Listing/history APIs remain milestone 6 and final delivery milestone 7; neither has started.
+
 ### Milestone 2 checkpoint
 
 The proposed project tree is generated, with an additional shared integration-test support class to avoid duplicating PostgreSQL/HTTP setup. Maven dependencies and the official Maven Wrapper were downloaded. The implementation and run instructions are documented in [README.md](README.md), and [DESIGN.md](DESIGN.md) now distinguishes this slice from the complete target architecture.

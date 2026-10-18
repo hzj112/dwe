@@ -32,7 +32,7 @@ Priority order:
 
 ### Milestone 4 — Crash recovery and connectivity failures
 
-**Implementation checkpoint:** Authorized, implemented, and verified. Clean verification passed 29 unit tests and 47 PostgreSQL integration tests without failures or skips. `RecoveryCoordinator` and guarded recovery settle expired attempts, while explicit terminal-outcome lookup reconciles lost result responses. New tests cover ownership deadlines, recovery/renewal races, uncertainty, and shutdown. The portable container script built the image and verified process death, worker network isolation, and a full database pause; all recovered with one abandoned and one completed attempt plus downstream completion. No public API or schema changes were needed. Milestone 5 has not started.
+**Implementation checkpoint:** Authorized, implemented, verified, and committed as `457e0ec`. Clean verification passed 29 unit tests and 47 PostgreSQL integration tests without failures or skips. `RecoveryCoordinator` and guarded recovery settle expired attempts, while explicit terminal-outcome lookup reconciles lost result responses. New tests cover ownership deadlines, recovery/renewal races, uncertainty, and shutdown. The portable container script built the image and verified process death, worker network isolation, and a full database pause; all recovered with one abandoned and one completed attempt plus downstream completion. No public API or schema changes were needed. Subsequent milestone 5 work is recorded below.
 
 **Outcome:** Interrupted work recovers automatically without accepting stale results.
 
@@ -47,6 +47,8 @@ Priority order:
 Use controlled PostgreSQL race tests and container-level crash/partition tests; basic mocks alone are insufficient evidence.
 
 ### Milestone 5 — Complete retries and manual workflow retry
+
+**Implementation checkpoint:** Authorized and implemented; changes remain uncommitted for review. Clean verification passed 42 unit tests and 70 PostgreSQL integration tests with no failures or skips. The registered `FAIL_UNTIL_ATTEMPT` handler and retry endpoint demonstrate automatic success, permanent failure, and new-cycle manual resumption. Tests cover backoff, allowances, preserved outputs/history, concurrency, validation, and rollback. The image built and portable container checks passed, including actual API/worker restart during backoff. No new schema or dependencies were needed. Milestone 6 has not started.
 
 **Outcome:** Users can recover failed workflows while preserving completed work and history.
 

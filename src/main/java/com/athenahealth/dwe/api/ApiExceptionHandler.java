@@ -15,11 +15,13 @@ import org.springframework.web.ErrorResponse;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
+import org.springframework.web.server.ResponseStatusException;
 
 import com.athenahealth.dwe.api.ExecutionDtos.ApiError;
 import com.athenahealth.dwe.api.ExecutionDtos.ErrorEnvelope;
 import com.athenahealth.dwe.persistence.WorkflowQueries.ResourceNotFoundException;
 import com.athenahealth.dwe.service.WorkflowValidationService.InvalidWorkflowException;
+import com.athenahealth.dwe.persistence.WorkflowStore.RetryConflictException;
 
 /** Converts exceptions from API requests into consistent HTTP statuses and JSON error responses. */
 @RestControllerAdvice
@@ -42,9 +44,15 @@ public class ApiExceptionHandler {
         return error(HttpStatus.NOT_FOUND, "NOT_FOUND", e.getMessage());
     }
 
-    /** Preserves Spring's HTTP status and headers for unsupported routes, methods, and content types. */
+    /** Retry eligibility is state-dependent; clients receive a stable conflict code rather than a server error. */
+    @ExceptionHandler(RetryConflictException.class)
+    ResponseEntity<ErrorEnvelope> retryConflict(RetryConflictException e) {
+        return error(HttpStatus.CONFLICT, e.code(), e.getMessage());
+    }
+
+    /** Preserves Spring's HTTP status and headers, including explicit request validation rejections. */
     @ExceptionHandler({NoResourceFoundException.class, HttpRequestMethodNotSupportedException.class,
-            HttpMediaTypeNotSupportedException.class})
+            HttpMediaTypeNotSupportedException.class, ResponseStatusException.class})
     ResponseEntity<ErrorEnvelope> httpError(Exception exception) {
         ErrorResponse response = (ErrorResponse) exception;
         String code = switch (response.getStatusCode().value()) {
@@ -53,8 +61,10 @@ public class ApiExceptionHandler {
             case 415 -> "UNSUPPORTED_MEDIA_TYPE";
             default -> "INVALID_REQUEST";
         };
+        String message = exception instanceof ResponseStatusException rejected ? rejected.getReason()
+                : "Request does not match a supported endpoint";
         return ResponseEntity.status(response.getStatusCode()).headers(response.getHeaders())
-                .body(new ErrorEnvelope(new ApiError(code, "Request does not match a supported endpoint", List.of())));
+                .body(new ErrorEnvelope(new ApiError(code, message, List.of())));
     }
 
     /** A lost database response can leave the outcome uncertain; return 503 rather than claim success. */
