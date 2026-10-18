@@ -2,6 +2,8 @@
 
 ## Status and review boundary
 
+Current status: milestones 2–6 are committed, latest `a12f473`; milestone 7 final verification is complete, with delivery changes uncommitted for review. The environment observations, proposed implementation tree, and earlier checkpoint statements below are historical records. Current behavior and commands are described in README.md and DESIGN.md; Milestones.md governs the roadmap.
+
 Prepared on 2026-10-17 (America/New_York) for review before application code generation, with environment results updated after Docker Desktop was started. Milestone 2 was subsequently authorized and implemented. The environment-validation sections below preserve the observations made before implementation; the checkpoint records the newer project-specific results. No global shell-profile changes have been made.
 
 The architecture and contracts in [DESIGN.md](DESIGN.md) govern implementation. [PROJECT_DESCRIPTION.md](PROJECT_DESCRIPTION.md) defines the must-have scope, and [AGENTS.md](AGENTS.md) requires one approved milestone at a time. The original [assignment PDF](<Take Home Distributed Systems Exercise - athenahealth.pdf>) was reread, including its technical constraints and deliverables. `PROJECT_CONTEXT.md` is referenced in the instructions but is not currently present on disk; the existing description and approved design provide the implementation context.
@@ -43,13 +45,24 @@ Milestone 4 was committed as `457e0ec`. Milestone 5 was subsequently authorized,
 
 ### Milestone 6 checkpoint
 
-Milestone 5 was committed as `8bd788e`. Milestone 6 was subsequently authorized, implemented, and verified; changes remain uncommitted for review.
+Milestone 5 was committed as `8bd788e`. Milestone 6 was subsequently authorized, implemented, verified, and committed as `a12f473`.
 
 - Added execution listing and cycle/attempt history routes, DTOs, read-only persistence queries, and versioned resource/filter-bound continuation tokens.
 - Kept the existing schema, indexes, dependencies, and execution behavior. Each request reads a consistent snapshot; separate pages are not a frozen history snapshot.
 - Added 14 cursor unit cases and 37 PostgreSQL/HTTP scenarios for pagination, timestamp ties, filters, errors, multi-cycle records, and unchanged stored state. Full clean verification passed 56 unit tests and 107 integration tests without failures, errors, or skips.
 - Added commented `scripts/verify-history.py` using the isolated Compose fixture. Image build and public API checks passed, including preserved prior history after manual retry; temporary resources were cleaned up.
 - Updated README and DESIGN with usage, pagination semantics, rationale, and limitations. Milestone 7 final delivery verification has not started.
+
+### Milestone 7 checkpoint
+
+Milestone 6 was committed as `a12f473`. Milestone 7 was subsequently authorized, implemented, and verified; changes remain uncommitted for review.
+
+- Added commented `scripts/verify-delivery.py` using ordinary engine settings. Its Compose `up` builds a missing unique image, runs shipped examples, checks branch overlap/join ordering and one recorded attempt with two workers available, and verifies application/database restarts.
+- Compared every column of the five execution tables before and after restarts, including full container recreation with its database volume retained. A queued execution survived recreation and completed under its original ID/configuration with one attempt per step.
+- Extended only the existing disposable fixture's timing option; no Java implementation, schema, API contract, or dependency changes were needed.
+- Completed README architecture/API diagrams and examples, configuration/troubleshooting guidance, and a reproducible requirement-to-evidence matrix. Consolidated DESIGN's historical checkpoints into a current implementation summary while preserving decision rationale, alternatives, guarantees, and deferred work.
+- Final verification on 2026-10-18 used a fresh local clone of `a12f473` plus the pending milestone 7 files. Clean Maven verification passed 56 unit tests and 107 PostgreSQL integration tests without failures/errors/skips. Delivery, recovery, retry, and history scripts each built isolated images/stacks and passed, including actual process death, worker/database partition, database pause, and restart during retry backoff. Temporary stacks/volumes/images and the checkout were cleaned up.
+- Ordinary Maven/Docker caches were reused; original build artifacts, `.env`, and IDE settings were not copied. This is local candidate verification before commit, not evidence of an already-published milestone 7 clone, another platform, empty caches, or production load capacity. Optional milestones have not started; recommend a checkpoint commit after review.
 
 ### Milestone 2 checkpoint
 

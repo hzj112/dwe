@@ -2,11 +2,36 @@
 
 A Java 21 / Spring Boot application with PostgreSQL-backed workflow state and leased worker claims. Maven builds a single artifact that runs as either an API/coordinator or a worker process. The approved architecture is in [DESIGN.md](DESIGN.md); the current milestone breakdown is in [Milestones.md](Milestones.md), with earlier planning and environment checks in [Plan.md](Plan.md).
 
-## Current implementation: milestone 6
+## Implementation and delivery scope
 
 This checkpoint implements validated submission, paginated execution listing, execution/step queries, cycle/attempt history, manual workflow retry, Flyway-managed storage, handler registration, conditional claims, lease renewal, fencing, durable outcome reporting, sequential/parallel DAG execution, and expired-attempt recovery. Compose starts two worker containers by default, each with two handler slots. `ECHO`, `DELAY`, and `FAIL_UNTIL_ATTEMPT` are predefined demonstration handlers. API and workers run in separate containers using the same image.
 
-Recovery settles expired attempts as `ABANDONED` and schedules another attempt when the workflow is active and allowance remains. Expiry exhausting the allowance fails the workflow; expired siblings on already-failed workflows are settled without retry. Manual retry creates a fresh cycle after all attempts settle, preserving completed work and history. All agreed API routes are implemented; final delivery and fresh-checkout verification remain milestone 7.
+Recovery settles expired attempts as `ABANDONED` and schedules another attempt when the workflow is active and allowance remains. Expiry exhausting the allowance fails the workflow; expired siblings on already-failed workflows are settled without retry. Manual retry creates a fresh cycle after all attempts settle, preserving completed work and history. All agreed API routes are implemented. This is a local assignment deployment with the limitations described below; optional extensions are prioritized in Milestones.md.
+
+## Architecture overview
+
+```mermaid
+flowchart TB
+    Client[Client / curl / verification scripts]
+    subgraph APIProcess[Spring Boot API process]
+        API[REST API and validation]
+        Coordinator[WorkflowCoordinator: dependency readiness and completion]
+        Recovery[RecoveryCoordinator: expired attempt recovery]
+    end
+    DB[(PostgreSQL: executions, cycles, steps, dependencies, attempts)]
+    subgraph Workers[Two long-running worker processes]
+        W1[WorkerRuntime + LeaseManager + registered handlers]
+        W2[WorkerRuntime + LeaseManager + registered handlers]
+    end
+    Client -->|Submit, inspect, retry| API
+    API <-->|Transactional commands / read snapshots| DB
+    Coordinator <-->|Poll and advance| DB
+    Recovery <-->|Poll and recover| DB
+    W1 <-->|Claim, renew, report| DB
+    W2 <-->|Claim, renew, report| DB
+```
+
+The API and both coordinators share one process. Workers run separately and use PostgreSQL as both durable storage and the work queue. A shared Maven artifact supplies both runtime profiles. Handlers execute outside database transactions; short guarded transactions protect claims and lifecycle changes. Each worker has two execution slots by default. No external message broker or worker registry is required.
 
 ## Prerequisites and build
 
@@ -24,6 +49,14 @@ export JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home
 Use the path to your own Java 21 installation on other machines. Maven Enforcer rejects unsupported Java versions. `verify` runs unit tests and PostgreSQL integration tests through Testcontainers; it fails if Docker is unavailable. `./mvnw test` runs unit tests only. The test database is disposable and separate from the Compose database. No host PostgreSQL installation is needed.
 
 ## Run with Docker Compose
+
+From the repository root, the assignment startup command builds a missing image and starts the complete system in the foreground:
+
+```sh
+docker-compose up
+```
+
+Use a second terminal for the HTTP examples. For detached startup, or to rebuild after source changes:
 
 ```sh
 docker-compose up --build -d --wait
@@ -191,6 +224,60 @@ python3 scripts/verify-history.py
 
 This uses the recovery script's isolated Compose fixture, verifies failed execution listing, paginated cycles/attempts, retained history after manual retry, and filter errors, then removes its own temporary resources. It requires Python 3 and Docker Compose, with no additional Python packages.
 
+The complete API uses the `/api/v1` prefix:
+
+| Method | Route | Result |
+| --- | --- | --- |
+| POST | `/executions` | Submit a definition/inputs; 201 and a status `Location` |
+| GET | `/executions` | Paginated execution summaries |
+| GET | `/executions/{id}` | Definition, inputs, status, error, and step summaries |
+| GET | `/executions/{id}/steps/{stepId}` | Step configuration, output, error, and attempt counts |
+| GET | `/executions/{id}/cycles` | Paginated initial/manual-retry cycle history |
+| GET | `/executions/{id}/attempts` | Paginated worker attempt history |
+| POST | `/executions/{id}/retry` | Resume a settled failed execution; 200; no request body |
+
+HTTP errors use `{"error":{"code":"...","message":"...","details":[]}}`. Invalid requests return 400, missing resources 404, ineligible retry commands 409, database failures 503, and unexpected server errors 500. A 503 or lost command response does not prove the command failed to commit. Status receipts acknowledge persisted commands rather than completion of asynchronous work.
+
+## Configuration
+
+`.env.example` lists the host-port and database variables consumed by Compose. Engine defaults are in `application.yml` and validated by `EngineProperties` at startup:
+
+| Environment variable inside the application | Default | Purpose |
+| --- | --- | --- |
+| `ENGINE_WORKER_CONCURRENCY` | 2 | Handler slots per worker |
+| `ENGINE_LEASE_DURATION` | 30s | Database ownership duration |
+| `ENGINE_HEARTBEAT_INTERVAL` | 5s | Renewal frequency |
+| `ENGINE_SAFETY_MARGIN` | 5s | Local cancellation margin before lease expiry |
+| `ENGINE_OPERATION_TIMEOUT` | 2s | Database operation budget used by ownership logic |
+| `ENGINE_POLL_INTERVAL` | 1s | Worker discovery interval |
+| `ENGINE_COORDINATOR_INTERVAL` | 1s | Dependency promotion/completion interval |
+| `ENGINE_RECOVERY_INTERVAL` | 5s | Expired-attempt scan interval |
+| `ENGINE_SHUTDOWN_GRACE` | 30s | Worker drain period; Compose allows 40s |
+| `ENGINE_DEFAULT_MAX_ATTEMPTS` | 3 | Per-step allowance per cycle, including first claim |
+| `ENGINE_DEFAULT_BACKOFF_INITIAL_MS` / `ENGINE_DEFAULT_BACKOFF_MAX_MS` | 1000 / 30000 | Retry defaults persisted at submission |
+| `DB_POOL_SIZE` | 8 | Maximum JDBC connections per application process |
+
+The heartbeat interval plus operation timeout plus safety margin must be less than the lease duration. Changing default retry settings affects new submissions; existing executions retain their persisted policies. The operation budget does not replace JDBC/Hikari timeouts: connection and socket timeouts are configured separately in `application.yml`. Keep the Compose stop grace longer than the worker drain period when changing shutdown settings.
+
+For a local Java process, export these variables before launching the jar. For Compose, host variables are passed into containers only where the Compose file explicitly maps them. To customize engine settings, add a local `compose.override.yml` and use both files:
+
+```yaml
+services:
+  api:
+    environment:
+      ENGINE_RECOVERY_INTERVAL: 2s
+  worker:
+    environment:
+      ENGINE_WORKER_CONCURRENCY: 4
+      DB_POOL_SIZE: 10
+```
+
+```sh
+docker-compose -f docker-compose.yml -f compose.override.yml up --build -d --wait
+```
+
+Apply shared ownership timing changes consistently to API and worker environments. Increasing worker count or slots also increases database and downstream load; no throughput benchmark is claimed.
+
 ## Local Java processes
 
 Start only the database, package the application, and run the roles in separate terminals:
@@ -230,4 +317,46 @@ No authentication, external-code execution, recurring schedules, cancellation AP
 - Container smoke test: build the shared image, start API/worker/PostgreSQL with the assignment's `docker-compose` command, submit the sample through HTTP, and verify stored results after application restart.
 - Portable container recovery verification: `scripts/verify-recovery.py` exercises actual process death, worker network isolation, and PostgreSQL unavailability using disposable infrastructure.
 
-Maven reports are under `target/surefire-reports` and `target/failsafe-reports`. Run milestone 3 integration tests with `./mvnw -Dit.test=ParallelWorkflowIT,WorkflowConcurrencyIT verify`, milestone 4 with `./mvnw -Dit.test=LeaseRecoveryIT,WorkerFailureIT verify`, milestone 5 with `./mvnw -Dit.test=AutomaticRetryIT,ManualRetryIT verify`, or milestone 6 with `./mvnw -Dit.test=ExecutionHistoryIT verify`. These commands also run unit tests. The milestone 6 clean checkpoint passed 56 unit tests and 107 integration tests without failures or skips. Final delivery verification remains milestone 7.
+Maven reports are under `target/surefire-reports` and `target/failsafe-reports`. Run milestone 3 integration tests with `./mvnw -Dit.test=ParallelWorkflowIT,WorkflowConcurrencyIT verify`, milestone 4 with `./mvnw -Dit.test=LeaseRecoveryIT,WorkerFailureIT verify`, milestone 5 with `./mvnw -Dit.test=AutomaticRetryIT,ManualRetryIT verify`, or milestone 6 with `./mvnw -Dit.test=ExecutionHistoryIT verify`. These commands also run unit tests. Final clean verification passed 56 unit tests and 107 integration tests without failures or skips.
+
+## Final verification from a fresh clone
+
+Clone the repository into an empty directory and select Java 21. Docker must be running; Python 3 is needed for the standalone container checks. Run these commands from that checkout:
+
+```sh
+./mvnw -B -ntp clean verify
+python3 scripts/verify-delivery.py
+python3 scripts/verify-recovery.py
+python3 scripts/verify-retries.py
+python3 scripts/verify-history.py
+```
+
+| Evidence | What it checks |
+| --- | --- |
+| Maven unit/PostgreSQL integration suite | Validation, state transitions, controlled worker races, stale fencing, uncertainty, retries, and API contracts |
+| `verify-delivery.py` | Compose `up` builds a missing image; ordinary engine defaults; sequential/parallel/retry/permanent-failure/manual-retry examples; branch overlap/join ordering; two workers with one durable attempt for a single step; application and database restarts; full container recreation retaining the volume and resuming queued work |
+| `verify-recovery.py` | Owning worker killed; worker/database network partition; full database pause; abandoned attempt followed by bounded replacement |
+| `verify-retries.py` | Retry limits/classification, retained outputs/history, and API/worker restart during persisted backoff |
+| `verify-history.py` | Public listing, paginated cycles/attempts, filtering/errors, and immutable prior history after manual retry |
+
+The delivery check uses default engine timings. The fault/retry/history fixtures use shorter timings to keep their scenarios bounded. Each script builds its own uniquely tagged image, uses disposable ports and a separate named volume, and cleans up its own resources even on assertion failure. Ordinary Maven/Docker dependency caches may be reused; these checks do not require empty caches. Container competition confirms one recorded attempt with two available workers; the Maven gated race tests provide deterministic evidence of simultaneous competing claim paths. Allow several minutes for the full sequence, longer for initial dependency/image downloads.
+
+To inspect the normal local stack after verification, run `docker-compose up`. `docker-compose down` retains its named volume. Removing that volume deletes the stored executions; the verification scripts remove only their own disposable volumes after their assertions.
+
+Final local verification on 2026-10-18 passed the full command sequence above from a fresh clone of `a12f473` with the pending milestone 7 files applied for review. No original `target`, `.env`, or IDE files were copied; ordinary dependency/image caches were reused. The normal local Compose project was left untouched. This is verification of the uncommitted candidate on the local macOS/Docker environment; repeat from the final published revision if its contents change.
+
+## Troubleshooting
+
+| Symptom | Check or action |
+| --- | --- |
+| Maven rejects Java or selects a different JDK | Set `JAVA_HOME` to Java 21; check `./mvnw -version`. |
+| Integration tests cannot find Docker | Start Docker Desktop and check `docker info`. Do not skip integration tests to declare verification complete. |
+| Port 8080 or 5432 is already used | Set `API_PORT`/`DB_PORT` in `.env`; adjust curl URLs. Internal Compose DB port remains 5432. |
+| API is unavailable immediately after startup/restart | Wait for `/actuator/health` to report UP; inspect `docker-compose ps` and `docker-compose logs --tail=100 api postgres`. |
+| Database authentication fails after changing `.env` | An existing PostgreSQL volume retains its initialized database/user/password. Restore the matching values or deliberately migrate credentials; changing initialization variables does not rewrite existing users. |
+| Workflow stays pending or a step waits | Check worker logs and dependency statuses; the coordinator must run in the API process. A blocked step acquires no attempt until all dependencies complete. |
+| Retry returns 409 | Only FAILED executions are eligible. Existing RUNNING attempts, including expired ones awaiting recovery, must settle first. Inspect attempt history. |
+| Repeated `ABANDONED` attempts or slow recovery | Inspect worker/database connectivity, lease/heartbeat safety settings, pool usage, and available CPU. Recovery plus backoff/polling adds latency; there is no strict recovery deadline. |
+| Verification times out | Read the emitted API/worker/PostgreSQL logs and check Docker resources. Address the failure and rerun; scripts use unique projects so the normal local stack stays separate. |
+
+The deployment has no authentication, database replication, backup automation, load benchmark, cancellation API, or exactly-once external effects. It is intended for local evaluation. DESIGN.md records failure guarantees and prioritized future work.

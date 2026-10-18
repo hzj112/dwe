@@ -2,6 +2,8 @@
 
 ## Starting point and priorities
 
+Current status: milestones 2–6 are committed, most recently milestone 6 as `a12f473`. Milestone 7 delivery work is implemented and verified, with changes uncommitted for review; optional milestones have not started. The starting-point paragraph and earlier checkpoints below are historical.
+
 Milestone 2 is committed as `91600a6`. It provides submission/status APIs, durable storage, registered handlers, claims, fencing, heartbeats, basic retry transitions, and sequential execution. Verification at that checkpoint passed 24 unit tests and 21 integration tests.
 
 This roadmap follows the [original assignment](<Take Home Distributed Systems Exercise - athenahealth.pdf>) and its instruction to prioritize fundamentals before stretch goals. [PROJECT_DESCRIPTION.md](PROJECT_DESCRIPTION.md) records the project scope, and the approved contracts in [DESIGN.md](DESIGN.md) remain authoritative. The larger remaining milestones in [Plan.md](Plan.md) are divided here into **five smaller milestones, 3–7**, followed by optional improvements. This document is the agreed milestone breakdown for future work; Plan.md preserves the earlier plan and environment-validation history.
@@ -62,7 +64,7 @@ Use controlled PostgreSQL race tests and container-level crash/partition tests; 
 
 ### Milestone 6 — Listing and execution history APIs
 
-**Implementation checkpoint:** Authorized, implemented, and verified; changes remain uncommitted for review. All three read routes below use bounded pages, stable keyset ordering, and resource/filter-bound versioned cursors. Read-only queries expose existing state without modifying lifecycle or ownership. Clean verification passed 56 unit tests and 107 PostgreSQL integration tests without failures or skips, including 14 new cursor cases and 37 new API scenarios. The Docker image built and `scripts/verify-history.py` passed paginated history, listing, retained prior cycles/results after manual retry, filters, and error checks in a disposable stack. No schema or dependency changes were needed. Milestone 7 has not started.
+**Implementation checkpoint:** Authorized, implemented, verified, and committed as `a12f473`. All three read routes below use bounded pages, stable keyset ordering, and resource/filter-bound versioned cursors. Read-only queries expose existing state without modifying lifecycle or ownership. Clean verification passed 56 unit tests and 107 PostgreSQL integration tests without failures or skips, including 14 new cursor cases and 37 new API scenarios. The Docker image built and `scripts/verify-history.py` passed paginated history, listing, retained prior cycles/results after manual retry, filters, and error checks in a disposable stack. No schema or dependency changes were needed. Subsequent milestone 7 work is recorded below.
 
 **Outcome:** Users can inspect executions and understand failures through the API.
 
@@ -79,6 +81,10 @@ Use the existing design's response fields, filters, keyset ordering, and resourc
 **Why this is required:** Listing is an explicit assignment requirement. Cycle/attempt APIs also complete our approved visibility contract.
 
 ### Milestone 7 — Reproducible delivery and final verification
+
+**Implementation checkpoint:** Authorized, implemented, and verified; changes remain uncommitted for review. Added `scripts/verify-delivery.py` with ordinary engine defaults, missing-image Compose startup, all functional examples, parallel/join evidence, two-worker single-attempt checks, exact terminal-row preservation across API/worker and PostgreSQL restarts, and full stack recreation with retained storage plus queued-work resumption. The existing isolated fixture gained an opt-out of accelerated timings without changing its default behavior. README now includes architecture/API overview, configuration, troubleshooting, and a verification evidence matrix. DESIGN describes current implementation, guarantees, trade-offs, and prioritized future work; earlier checkpoint history remains in Plan/Git.
+
+On 2026-10-18, a fresh local clone of `a12f473` with pending milestone 7 files overlaid passed clean Maven verification (56 unit tests, 107 PostgreSQL integration tests; no failures/errors/skips), image builds, and all four delivery/recovery/retry/history scripts. Ordinary caches were reused; no original build artifacts, `.env`, or IDE files were copied. All temporary projects were cleaned up. No Java, API-contract, schema, or dependency changes were needed. This completes the planned assignment implementation and local verification boundary; optional milestones remain unstarted. A checkpoint commit is recommended after review.
 
 **Outcome:** The repository is ready for assignment submission.
 

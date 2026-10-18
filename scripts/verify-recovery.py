@@ -22,7 +22,7 @@ import uuid
 class RecoveryCheck:
     """Owns all fault injection and cleanup for one uniquely named verification project."""
 
-    def __init__(self, directory):
+    def __init__(self, directory, *, fast_timing=True):
         self.root = Path(__file__).resolve().parents[1]
         self.project = 'dwe-recovery-' + uuid.uuid4().hex[:10]
         self.environment = dict(os.environ, API_PORT=str(self.free_port()), DB_PORT=str(self.free_port()),
@@ -34,7 +34,7 @@ class RecoveryCheck:
         settings = {'ENGINE_LEASE_DURATION': '5s', 'ENGINE_HEARTBEAT_INTERVAL': '500ms',
                     'ENGINE_OPERATION_TIMEOUT': '1s', 'ENGINE_SAFETY_MARGIN': '1s',
                     'ENGINE_RECOVERY_INTERVAL': '200ms', 'ENGINE_POLL_INTERVAL': '100ms',
-                    'ENGINE_COORDINATOR_INTERVAL': '100ms', 'ENGINE_SHUTDOWN_GRACE': '1s'}
+                    'ENGINE_COORDINATOR_INTERVAL': '100ms', 'ENGINE_SHUTDOWN_GRACE': '1s'} if fast_timing else {}
         image = 'dwe:' + self.project
         override = Path(directory) / 'compose.json'
         override.write_text(json.dumps({'services': {
