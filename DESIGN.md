@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-This document records the agreed architecture, persistence schema, execution lifecycle, database coordination behavior, worker operating defaults, and their rationale. It describes the intended system, not an implemented or verified system. Remaining details listed under **Open design decisions** still need agreement before their implementation.
+This document records the agreed architecture, handler contract, REST API and submission schema, persistence schema, execution lifecycle, database coordination behavior, worker operating defaults, and their rationale. It describes the intended system, not an implemented or verified system. Remaining implementation details and deferred capabilities are identified separately.
 
 The initial implementation targets the must-have requirements in [PROJECT_DESCRIPTION.md](PROJECT_DESCRIPTION.md) and follows [AGENTS.md](AGENTS.md). Scalability influences component boundaries and concurrency guarantees from the start, while additional infrastructure and optimizations remain future work. `PROJECT_CONTEXT.md` was referenced in the project instructions but was not present on disk when this document was created.
 
@@ -82,7 +82,7 @@ Runtime roles should remain separable so that API-only and coordinator-only depl
 3. **Claim a step.** An available worker atomically claims an eligible step and records its attempt, owner, lease expiration, and fencing token. The transaction must also ensure the workflow still permits execution. Competing workers cannot obtain the same valid claim.
 4. **Execute the handler.** The worker invokes the selected Java handler outside the database transaction and renews its lease while execution continues. Business execution must not hold a database transaction open for the duration of a step.
 5. **Persist the outcome.** The worker records success and output, or failure and error details, only while its fencing token and lease remain valid. The attempt outcome and corresponding execution-state change must be recorded consistently.
-6. **Advance, retry, or fail.** Successful dependencies allow downstream work to become eligible. Failed or abandoned attempts are retried after backoff when allowance remains and the workflow is active. A step that exhausts its allowance fails the workflow and current cycle. Waiting steps are marked failed; already-running attempts may finish without further automatic retries.
+6. **Advance, retry, or fail.** Successful dependencies allow downstream work to become eligible. Retryable failures and abandoned attempts are retried after backoff when allowance remains and the workflow is active. An explicit permanent failure or exhausted allowance fails the workflow and current cycle. Waiting steps are marked failed; already-running attempts may finish without further automatic retries.
 7. **Complete, inspect, or manually retry.** The workflow becomes `COMPLETED` only when all required steps complete successfully. Clients can query persisted progress and history during execution and after restarts. Manual retry resumes a failed execution in a new cycle after all running attempts have settled, reusing completed outputs and granting unfinished steps fresh attempt allowances.
 
 ### Example DAG
@@ -97,6 +97,290 @@ flowchart LR
 ```
 
 Processing and validation can run concurrently on separate workers. Aggregation waits for both to complete successfully.
+
+## Java handler contract and registration
+
+### Initial execution model
+
+The initial application supports a predefined set of Java handlers registered at startup. The coordinator is generic: it evaluates dependencies and execution state without understanding what a business action does. `actionType` is an opaque, extensible string used by the worker's registry to select an implementation; `action_type` remains in the persistence schema. It is not a closed enum containing the five operations in the example DAG.
+
+Each handler supplies its action type and is added through a registry operation such as `register(handler)`. Reject duplicate action types at startup. Submission validation rejects unregistered types, and the API and all workers initially use the same supported handler set. Registration is an internal startup operation, not a REST endpoint. Supply a few predefined handlers for the demonstrations; their exact names and business examples are implementation choices.
+
+Adding an action initially means implementing and registering another Java handler, then rebuilding and deploying the application. It does not require changing orchestration, dependency evaluation, claims, leases, retry scheduling, or the database schema. Users can compose different DAGs, use one handler in multiple steps, and configure it with different parameters.
+
+### Interface and context
+
+Use a synchronous Java interface. The following is the intended contract; `JsonNode` denotes Jackson's JSON tree representation, with the concrete dependency version selected when creating the Maven project:
+
+```java
+public interface StepHandler {
+    String actionType();
+
+    void validateParameters(JsonNode parameters)
+        throws StepValidationException;
+
+    JsonNode execute(StepContext context)
+        throws StepExecutionException, InterruptedException;
+}
+```
+
+`validateParameters` checks step configuration during submission without business effects or external calls. Validation that requires dependency results happens during execution. `execute` runs exactly one local invocation for a claimed attempt; it returns an output or reports failure. The runtime never reruns it merely to retry reporting an outcome.
+
+| Context field or operation | Meaning |
+| --- | --- |
+| `executionId`, `stepId` | Logical work identity. |
+| `cycleNo`, `attemptNo` | Diagnostic execution metadata; attempt number is the lifetime number, not a counter reset on manual retry. |
+| `workflowInputs` | Immutable submitted workflow inputs. |
+| `parameters` | Parameters configured for this step. |
+| `dependencyOutputs` | Map from direct prerequisite step IDs to their successful output objects; empty for roots. |
+| `idempotencyKey` | Stable key derived from execution ID and step ID, unchanged across attempts and manual retry cycles. |
+| `checkCancelled()` | Throws `InterruptedException` when the runtime has given up the attempt or ended shutdown draining; handlers also honor ordinary thread interruption. |
+
+The context exposes no persistence repository, claim operation, heartbeat operation, or workflow-state setter. Claims, renewals, reporting, retries, and cancellation signaling belong to the worker runtime and shared engine services.
+
+Workflow inputs, step parameters, and successful outputs are JSON objects. Use `{}` when no data is needed; a Java null or non-object output violates the handler contract and is treated as a permanent `INVALID_HANDLER_OUTPUT` failure. Each invocation receives isolated input data so mutation cannot change another invocation or persisted configuration. Handlers must be stateless or safe for concurrent invocation.
+
+Expose only direct dependency outputs. Access to another step's result requires declaring that dependency. There is no input-expression language or placeholder substitution initially; handlers explicitly read their parameters, workflow inputs, and dependency outputs.
+
+### Failure classification and idempotency
+
+`StepExecutionException` carries a stable error code, useful message, and `retryable` boolean. Preserve that classification in failed attempt history so clients can understand why an attempt terminated the workflow before its allowance was exhausted.
+
+| Outcome | Runtime behavior |
+| --- | --- |
+| Explicit retryable failure | Retry within the current cycle's remaining allowance and backoff while the workflow is active. |
+| Explicit permanent failure | Fail the step, execution, and current cycle immediately, regardless of remaining allowance. |
+| Unexpected ordinary exception | Record a retryable execution failure, bounded by the same attempt allowance. Fatal process/JVM failure is handled through lease recovery rather than converted into an ordinary handler exception. |
+| Interruption after ownership loss or shutdown draining ends | Follow local cancellation and abandonment rules; do not report a business failure after giving up ownership. |
+| Unexpected interruption while ownership is still valid and the runtime has not cancelled | Record a retryable failure through the guarded outcome path. |
+| Database failure while recording an outcome | Reconcile/retry database reporting separately, retaining the handler result while ownership permits; do not classify it as a fresh handler failure or rerun the handler merely to report. |
+
+Permanent failure adds an explicit terminal trigger alongside exhausted attempts; it does not consume or fabricate extra attempts. Manual retry remains available after running attempts settle, with the same fresh-cycle rules. Interruption and local cancellation remain best effort and do not add a public workflow cancellation API.
+
+Handlers do not implement workflow-level retry loops. For external effects, use idempotent operations or a downstream-supported idempotency key. Do not include cycle or attempt numbers in the logical step key: doing so defeats duplicate suppression across retries. A key alone provides no guarantee unless the downstream operation honors it. A new execution has a different key; completed outputs reused by manual retry are not recomputed.
+
+### Future execution without predefined registration
+
+Future versions may accept arbitrary or externally supplied handlers that do not require pre-registration or rebuilding this application. Possible approaches include a generic executor invoking an external endpoint or resolving a dynamically supplied implementation. The mechanism is deliberately undecided and deferred; v1 does not upload code, dynamically load classes from submissions, or execute arbitrary commands.
+
+Such a model still needs an executable target or resolution protocol; removing `actionType` alone does not supply executable behavior. It may evolve or replace the current registry reference when that model is designed. Preserve the separation between execution adapters and orchestration so the change can retain the same claim, lease, fencing, outcome, and retry guarantees. Worker compatibility, target validation, isolation, and implementation/version identity would need explicit design then. This is future flexibility, not a restriction to the illustrative fetch/process/validate/aggregate/publish operations.
+
+## Retry-policy defaults
+
+| Setting | Initial default | Override |
+| --- | --- | --- |
+| `maxAttempts` | 3, including the first claim | Per step. |
+| `backoffInitialMs` | 1000 | Per step. |
+| `backoffMaxMs` | 30000 | Per step. |
+| Exponential multiplier | 2 | Fixed initially. |
+
+Fill omitted retry fields individually from application configuration. Missing `retry` is equivalent to an empty override object. Validate positive integers and require effective maximum backoff to be at least effective initial backoff; values must fit the Java/PostgreSQL integer types used in the persistence schema. Explicit nulls are invalid. Persist effective values during submission, so later changes to application defaults do not change an existing execution or its manual retries.
+
+With defaults, a retryable failure permits two retries after delays of 1 and 2 seconds. Permanent failures bypass automatic retries. Abandoned attempts count toward allowance, and manual retry grants unfinished steps a fresh allowance using the execution's persisted policy. These are business-step retries; heartbeat retries and database-reporting reconciliation use the separate runtime rules.
+
+## REST API contract
+
+### Resource and routes
+
+Use `/api/v1/executions` for the main resource: each submission creates a run rather than a reusable definition. Payloads use JSON and camelCase; statuses use the uppercase values already defined. Timestamps are UTC strings, with null for unset values. UUID execution IDs and step identifiers are matched exactly; clients encode step IDs as URI path components.
+
+| Method | Route | Successful response |
+| --- | --- | --- |
+| `POST` | `/api/v1/executions` | `201 Created` after durable submission; execution receipt and `Location` header. |
+| `GET` | `/api/v1/executions` | `200 OK`; paginated execution summaries, optionally filtered by `status`. |
+| `GET` | `/api/v1/executions/{id}` | `200 OK`; current status, submitted configuration, and step summaries. |
+| `GET` | `/api/v1/executions/{id}/steps/{stepId}` | `200 OK`; step configuration, effective retry settings, current output/error, and attempt counts. |
+| `GET` | `/api/v1/executions/{id}/cycles` | `200 OK`; paginated cycle history. |
+| `GET` | `/api/v1/executions/{id}/attempts` | `200 OK`; paginated attempt history, optionally filtered by `stepId` and `cycleNo`. |
+| `POST` | `/api/v1/executions/{id}/retry` | `200 OK` after the manual-retry transaction commits; execution receipt for the new cycle. |
+
+These routes are client-facing; worker coordination uses the database, not additional claim/heartbeat REST endpoints. There are no definition-management, handler-registration, cancellation, or schedule APIs initially.
+
+### Submission example and receipt
+
+The action names and business parameters below are illustrative registered handlers, not an exhaustive action catalog or implementations already delivered. A handler's parameter validator defines its business-specific parameter shape.
+
+```json
+{
+  "definition": {
+    "steps": [
+      {
+        "id": "fetch",
+        "actionType": "FETCH_DATA",
+        "parameters": { "source": "demo" },
+        "dependsOn": [],
+        "retry": {
+          "maxAttempts": 3,
+          "backoffInitialMs": 1000,
+          "backoffMaxMs": 30000
+        }
+      },
+      {
+        "id": "process",
+        "actionType": "PROCESS_DATA",
+        "parameters": {},
+        "dependsOn": ["fetch"]
+      }
+    ]
+  },
+  "inputs": { "batchId": "batch-001" }
+}
+```
+
+On successful creation, set `Location` to `/api/v1/executions/{executionId}` and return this receipt:
+
+```json
+{
+  "executionId": "9b1ea890-c31b-4e64-8153-fb1248445a40",
+  "status": "PENDING",
+  "currentCycleNo": 1
+}
+```
+
+The receipt represents the committed submission state, not a guarantee the execution is still pending when the response reaches the client. A subsequent GET may already show progress. `201` indicates resource creation, not completion of business execution. Manual retry accepts no request body and returns the same receipt shape with its newly committed cycle number and initial `PENDING` status. It reuses existing definition, inputs, and effective retry policies.
+
+### Submission JSON Schema
+
+The following JSON Schema Draft 2020-12 defines the request body for `POST /api/v1/executions`. It is embedded here for review and can be extracted as a standalone schema during implementation. It does not define the response bodies or handler-specific business parameters. The `actionType` field is a nonblank string, not an enum, so registering another handler does not require changing the structural schema.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:dwe:schema:execution-submission:v1",
+  "title": "Workflow execution submission",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["definition"],
+  "properties": {
+    "definition": { "$ref": "#/$defs/definition" },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "$defs": {
+    "nonBlankString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "definition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["steps"],
+      "properties": {
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/step" }
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "actionType"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonBlankString" },
+        "actionType": { "$ref": "#/$defs/nonBlankString" },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlankString" },
+          "uniqueItems": true,
+          "default": []
+        },
+        "retry": { "$ref": "#/$defs/retry", "default": {} }
+      }
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3
+        },
+        "backoffInitialMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1000
+        },
+        "backoffMaxMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30000
+        }
+      }
+    }
+  }
+}
+```
+
+Unknown structural fields are rejected to catch misspellings; arbitrary business fields are allowed inside `inputs` and `parameters`. Optional fields may be omitted but cannot be explicitly null. JSON Schema `default` values are annotations documenting initial defaults; validators do not automatically insert them. Application normalization supplies missing inputs/parameters as `{}`, dependencies as `[]`, and each missing retry setting from the configured defaults. See the official [Draft 2020-12 validation specification](https://json-schema.org/draft/2020-12/json-schema-validation), [default annotations](https://json-schema.org/understanding-json-schema/reference/annotations), and [object validation guidance](https://json-schema.org/understanding-json-schema/reference/object).
+
+Structural validation is necessary but insufficient. Before persistence, application validation must reject duplicate step IDs, self/unknown dependencies, cycles, unregistered action types, invalid handler parameters, unsupported numeric ranges, and effective maximum backoff below effective initial backoff. These cross-record, registry, and cross-field checks are not enforced by this schema. Preserve the submitted definition snapshot; normalize defaults into the execution records rather than rewriting submitted configuration. Missing workflow inputs are normalized to an empty object for execution.
+
+### Status and history response fields
+
+| Response | Fields |
+| --- | --- |
+| Execution summary | `executionId`, `status`, `currentCycleNo`, `createdAt`, `firstStartedAt`, `finishedAt`, `runningStepCount`, `retryAllowed`. |
+| Execution detail | Summary fields plus submitted `definition`, normalized `inputs`, current-cycle `error`, and `steps` containing `stepId`/`status` summaries ordered by step ID. Outputs and attempt history use their separate endpoints. |
+| Step detail | `stepId`, `actionType`, normalized `parameters`, `dependsOn`, `status`, `eligibleAt`, effective `retry`, `attemptsInCurrentCycle`, `lastAttemptNo`, `output`, and `error`. |
+| Cycle item | `cycleNo`, `status`, `createdAt`, `startedAt`, `finishedAt`, `failedStepId`, and `error`. |
+| Attempt item | `stepId`, `cycleNo`, `attemptNo`, `workerId`, `status`, `startedAt`, `finishedAt`, `result`, and `error`; failed attempt errors also expose the recorded `retryable` boolean. |
+
+Resource errors use `code` and `message`; absent errors, outputs, and results are null. An attempt's `retryable` classification describes its failure, not whether budget remains. For step details, attempt counts are for that step and the execution's current cycle, even when its completed output originated in an earlier cycle. No aggregated workflow output is synthesized initially.
+
+`runningStepCount` includes steps still marked `RUNNING`, even when their lease is awaiting expiry recovery. A workflow can be `FAILED` with running steps. `retryAllowed` is true only for a failed workflow with no unfinished attempts; it is advisory because the retry transaction always rechecks current state. A failed execution's detail exposes the recorded terminal cycle error even if an independent attempt later succeeds.
+
+### Pagination and filters
+
+Executions, cycles, and attempts return an envelope with `items` and `nextCursor`, which is null when no further rows were found. `limit` defaults to 50 with an allowed range of 1 through 200. The next request passes `cursor` unchanged and retains its filters. Reject malformed cursors or a cursor used with different resource/filter values.
+
+- Executions: optional uppercase `status` filter; order by `createdAt DESC, executionId DESC`.
+- Cycles: order by `cycleNo DESC` within the execution.
+- Attempts: optional `stepId` and positive `cycleNo` filters; order by `startedAt DESC, stepId ASC, attemptNo DESC`. Support this query with a history-order index as recorded in the persistence section.
+
+Use opaque keyset cursors, not offset/page-number pagination. Mutable status filters and ongoing execution mean pages do not form a frozen snapshot. Clients can refresh from the first page for current history. Execution existence is checked for nested collection routes; an existing execution with no matching history returns an empty collection.
+
+### Error responses and uncertain commands
+
+Use one error envelope, with an empty `details` array when no field-specific details apply:
+
+```json
+{
+  "error": {
+    "code": "INVALID_WORKFLOW",
+    "message": "Workflow definition is invalid.",
+    "details": [
+      {
+        "path": "definition.steps[1].dependsOn",
+        "message": "Unknown dependency 'missing-step'."
+      }
+    ]
+  }
+}
+```
+
+| HTTP status | Meaning |
+| --- | --- |
+| `400 Bad Request` | Malformed JSON, invalid identifier/query/cursor, schema violation, invalid DAG, unsupported action, or invalid effective policy/handler parameters. |
+| `404 Not Found` | Execution or requested step does not exist. |
+| `409 Conflict` | Retry rejected with `WORKFLOW_NOT_FAILED` or `RUNNING_ATTEMPTS_REMAIN`. A concurrent successful retry changes the state and makes another request conflict. |
+| `503 Service Unavailable` | Temporary database unavailability. This does not establish that an interrupted command failed to commit. |
+| `500 Internal Server Error` | Unexpected server failure. |
+
+Expose stable error codes and useful messages without stack traces; log diagnostic exceptions server-side. Retry accepts no body; a supplied nonempty body is invalid rather than silently changing inputs or policy. HTTP creation/conflict semantics follow [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html).
+
+Submission initially has no durable HTTP idempotency key; repeating POST can create another execution. A lost response requires reconciliation rather than blind automatic resubmission. The retry endpoint also checks current state rather than deduplicating a request identity; repeating it after a later cycle has failed can start another cycle. Durable HTTP command deduplication is a future improvement, distinct from business-handler idempotency and internal database-outcome reconciliation.
 
 ## Persistence model
 
@@ -123,7 +407,7 @@ erDiagram
 
 ### Schema conventions
 
-The following is the target schema for implementation, not an applied migration. Columns are required unless marked nullable. Timestamps use PostgreSQL `TIMESTAMPTZ`, structured payloads use `JSONB`, and statuses use `TEXT` with allowed-value check constraints. Payload shapes will be settled with the handler and API contracts. Creation and update timestamps use database time.
+The following is the target schema for implementation, not an applied migration. Columns are required unless marked nullable. Timestamps use PostgreSQL `TIMESTAMPTZ`, structured payloads use `JSONB`, and statuses use `TEXT` with allowed-value check constraints. Inputs, parameters, and successful outputs follow the JSON-object handler contract and the submission schema above. Creation and update timestamps use database time.
 
 ### `workflow_execution`
 
@@ -153,7 +437,7 @@ Retains workflow-level outcomes when manual retry reopens an execution. For exam
 | `created_at` | TIMESTAMPTZ | Submission or manual retry time. |
 | `started_at` | TIMESTAMPTZ, nullable | First successful step claim in this cycle. |
 | `finished_at` | TIMESTAMPTZ, nullable | Workflow completion or failure time for this cycle. |
-| `failed_step_id` | TEXT, nullable | Step whose exhausted allowance caused this cycle to fail. |
+| `failed_step_id` | TEXT, nullable | Step whose permanent failure or exhausted allowance caused this cycle to fail. |
 | `error_code` | TEXT, nullable | Machine-readable failure reason. |
 | `error_message` | TEXT, nullable | Failure explanation. |
 
@@ -214,6 +498,7 @@ One row per successful claim, including claims abandoned after lease expiry. An 
 | `result_json` | JSONB, nullable | Successful attempt result. |
 | `error_code` | TEXT, nullable | Failure or abandonment reason. |
 | `error_message` | TEXT, nullable | Error details. |
+| `failure_retryable` | BOOLEAN, nullable | Reported failure classification, required for `FAILED` attempts and null for other attempt states. |
 
 **Primary key:** `(workflow_id, step_id, attempt_no)`. Foreign keys reference the step and cycle within the same execution. On claim, increment `step_execution.last_attempt_no` and copy it to the attempt in the same transaction. Recording success writes the attempt result and current step output together. Terminal attempts are immutable; manual retry creates new attempts rather than rewriting history.
 
@@ -225,6 +510,7 @@ One row per successful claim, including claims abandoned after lease expiry. An 
 - A step has both `worker_id` and `lease_expires_at` exactly when its state is `RUNNING`. Clear both when the attempt becomes terminal.
 - A non-null `eligible_at` is permitted only for `PENDING` or `RETRYING` steps. Clear it on claim or terminal failure.
 - Attempts, cycles, and the current workflow have a non-null `finished_at` exactly when their respective state is terminal.
+- Inputs and parameters are JSON objects. Step output and attempt result are non-null JSON objects exactly for `COMPLETED` records; use `{}` for successful work without output. Failed attempts have a non-null `failure_retryable` classification; other attempt states leave it null. Lease abandonment follows infrastructure retry policy rather than a reported handler classification.
 - A unique partial index on `(workflow_id, step_id)` where attempt status is `RUNNING` prevents two unfinished attempt records for the same step. Recovery must close an expired attempt before another claim is created.
 - Dependency satisfaction and agreement between current-state and history rows require transactional operations; they cannot be expressed as ordinary row-level check constraints.
 
@@ -236,6 +522,7 @@ One row per successful claim, including claims abandoned after lease expiry. An 
 | Expired leases | Partial index on `step_execution(lease_expires_at, workflow_id, step_id)` for `RUNNING` rows. |
 | Find downstream steps | `step_dependency(workflow_id, depends_on_step_id, step_id)` |
 | Per-cycle history and attempt counting | `step_attempt(workflow_id, cycle_no, step_id, attempt_no)` |
+| Attempt-history cursor ordering | `step_attempt(workflow_id, started_at DESC, step_id, attempt_no DESC)` |
 
 There is no worker registry table initially. Step leases provide the ownership information needed for recovery; worker membership tracking is not required for claiming work.
 
@@ -248,7 +535,7 @@ stateDiagram-v2
     [*] --> PENDING
     PENDING --> RUNNING: First step claimed
     RUNNING --> COMPLETED: All steps completed
-    RUNNING --> FAILED: Step exhausts allowance
+    RUNNING --> FAILED: Permanent failure or exhausted allowance
     FAILED --> PENDING: Manual retry creates next cycle
 ```
 
@@ -259,7 +546,7 @@ The diagram describes the execution's current status. An individual cycle never 
 | Creation in `PENDING` | Persist a validated nonempty DAG, inputs, initial cycle, steps, and dependencies atomically. Invalid submissions do not create an execution. |
 | `PENDING -> RUNNING` | First successful claim in the current cycle; set that cycle's `started_at` and set execution `first_started_at` only if absent. |
 | `RUNNING -> COMPLETED` | All steps are `COMPLETED`; finalize execution and current cycle together. |
-| `RUNNING -> FAILED` | A step exhausts its allowance; fail execution and current cycle, retain the triggering failure, and fail all waiting steps together. |
+| `RUNNING -> FAILED` | A step reports a permanent failure or exhausts its allowance; fail execution and current cycle, retain the triggering failure, and fail all waiting steps together. |
 | `FAILED -> PENDING` | Manual retry after running attempts settle; create the next cycle, reset failed steps, and clear execution `finished_at`. |
 
 There are no new claims for a `FAILED` or `COMPLETED` workflow. Late step completion cannot reverse a workflow's terminal outcome. Starting a full new run requires a new submission rather than reopening a completed execution.
@@ -283,9 +570,9 @@ stateDiagram-v2
 | --- | --- |
 | `PENDING -> RUNNING` | Dependencies are complete, eligibility has arrived, and an atomic claim succeeds. |
 | `RUNNING -> COMPLETED` | The current worker records success while its claim and lease are valid; clear current step error fields and retain errors in attempt history. This remains allowed after another step has failed the workflow. |
-| `RUNNING -> RETRYING` | The attempt fails or is abandoned, allowance remains, and the workflow is still active. Persist the next eligibility time. |
+| `RUNNING -> RETRYING` | The attempt has a retryable failure or is abandoned, allowance remains, and the workflow is still active. Persist the next eligibility time. |
 | `RETRYING -> RUNNING` | Backoff has elapsed and a new valid claim is acquired. |
-| `RUNNING -> FAILED` | No attempt allowance remains, or the attempt fails/is abandoned after the workflow has already failed. |
+| `RUNNING -> FAILED` | The failure is permanent, no attempt allowance remains, or the attempt fails/is abandoned after the workflow has already failed. |
 | `PENDING/RETRYING -> FAILED` | Workflow failure blocks further execution. Record `WORKFLOW_FAILED` without inventing an attempt. |
 | `FAILED -> PENDING` | Manual retry starts a new cycle; clear current error details and eligibility, retaining earlier history and the lifetime fencing counter. |
 
@@ -314,11 +601,11 @@ stateDiagram-v2
 
 The persistence design uses `max_attempts`, including the initial attempt, to avoid ambiguity between attempts and retries. Every successfully claimed attempt counts against its step's allowance in that cycle, including attempts later abandoned. Unclaimed work does not consume allowance. Count attempts by step and cycle while protecting the claim transaction from concurrent updates.
 
-Use capped exponential backoff with multiplier 2. After the nth unsuccessful attempt in the current cycle, delay the next attempt by `min(backoff_max_ms, backoff_initial_ms * 2^(n - 1))`, calculated without arithmetic overflow. Persist the effective limit and backoff values on the step. API defaults and handler-specific non-retryable failures remain open; no additional failure classification is assumed yet. Lease and heartbeat defaults are defined under **Worker runtime and operating defaults**.
+Use capped exponential backoff with multiplier 2. After the nth retry-eligible unsuccessful attempt in the current cycle, delay the next attempt by `min(backoff_max_ms, backoff_initial_ms * 2^(n - 1))`, calculated without arithmetic overflow. Persist the effective limit and backoff values on the step. Permanent failures skip backoff and immediately fail the workflow; retryable errors and abandonment obey the allowance. Initial retry defaults are 3 attempts, 1000 ms initial backoff, and 30000 ms maximum backoff, as defined above. Lease and heartbeat defaults are defined under **Worker runtime and operating defaults**.
 
 ### Workflow failure and manual retry
 
-When a step exhausts its allowance, atomically fail the workflow and current cycle and mark all `PENDING`/`RETRYING` steps `FAILED` with `WORKFLOW_FAILED`. Completed steps and their outputs remain intact. Already-running attempts may renew valid leases and record their actual outcomes, but receive no further automatic retries. Their success does not reopen the workflow or make downstream work eligible.
+When a step reports a permanent failure or exhausts its allowance, atomically fail the workflow and current cycle and mark all `PENDING`/`RETRYING` steps `FAILED` with `WORKFLOW_FAILED`. Completed steps and their outputs remain intact. Already-running attempts may renew valid leases and record their actual outcomes, but receive no further automatic retries. Their success does not reopen the workflow or make downstream work eligible.
 
 Recovery must continue examining running leases even for failed workflows. An expired attempt becomes `ABANDONED`; its step becomes `FAILED` without another automatic attempt. Marking a step failed does not cancel external actions, and no rollback is implied.
 
@@ -370,9 +657,9 @@ Acquire the workflow lock and verify the current attempt's worker, token, cycle,
 | Accepted outcome | Transactional effects |
 | --- | --- |
 | Success | Complete attempt and step, write result/output, clear current step errors, and clear ownership. |
-| Failure with allowance remaining and workflow active | Fail the attempt, clear ownership, move the step to `RETRYING`, and persist its next eligibility time. |
-| Failure exhausting allowance while workflow active | Fail attempt and step, fail execution and current cycle, preserve the triggering error, and fail all waiting steps with `WORKFLOW_FAILED`. |
-| Failure after the workflow already failed | Fail attempt and step and clear ownership, without scheduling another attempt. |
+| Retryable failure with allowance remaining and workflow active | Fail the attempt, record its classification, clear ownership, move the step to `RETRYING`, and persist its next eligibility time. |
+| Permanent failure or failure exhausting allowance while workflow active | Fail attempt and step, record its classification, fail execution and current cycle, preserve the triggering error, and fail all waiting steps with `WORKFLOW_FAILED`. |
+| Failure after the workflow already failed | Fail attempt and step, record the reported classification, and clear ownership, without scheduling another attempt. |
 
 Permanent workflow failure is applied in this transaction, not deferred to the next coordinator scan. Valid success after workflow failure only completes that step; it never reopens the workflow or promotes downstream work.
 
@@ -495,7 +782,7 @@ Workflow, step, and attempt states follow the lifecycle above. Each attempt and 
 | API process stops | Clients temporarily lose API access. In the initial combined process, the coordinator also stops. Independent workers and the database retain their own lifecycle. |
 | PostgreSQL is unavailable | New submissions, claims, renewals, and durable state changes cannot succeed. Progress requiring those operations pauses until connectivity returns. |
 | Handler succeeds externally but its result is not durably recorded | The engine may retry the step and repeat its external effects. |
-| A step exhausts retries | The workflow and current cycle fail. Waiting steps fail with `WORKFLOW_FAILED`. Running attempts may finish without automatic retries; manual retry waits for them to finish or be recovered after lease expiry. |
+| A step reports a permanent failure or exhausts retries | The workflow and current cycle fail. Waiting steps fail with `WORKFLOW_FAILED`. Running attempts may finish without automatic retries; manual retry waits for them to finish or be recovered after lease expiry. |
 
 The design favors consistent execution ownership and state over continued scheduling during database partitions. A local PostgreSQL volume preserves data across container restarts; a single database instance does not provide database high availability or protection against disk loss.
 
@@ -503,7 +790,7 @@ The design favors consistent execution ownership and state over continued schedu
 
 Execution is **at least once**, subject to configured retry limits. Leases and fencing protect engine state; they do not guarantee exactly-once effects in external systems or prevent all overlap between stale and replacement handler code.
 
-Handlers should use idempotent operations or stable external idempotency keys where possible. The handler contract must document these assumptions. Guaranteed cancellation of external work, user-facing workflow cancellation, and compensation are outside the initial scope; best-effort local handler interruption on ownership loss or shutdown is part of worker behavior. Lease-based crash recovery is required even though user-configurable execution timeouts are optional.
+Handlers follow the idempotency and cancellation assumptions in the handler contract above. Guaranteed cancellation of external work, user-facing workflow cancellation, and compensation are outside the initial scope; best-effort local handler interruption on ownership loss or shutdown is part of worker behavior. Lease-based crash recovery is required even though user-configurable execution timeouts are optional.
 
 ## Design choices and rationale
 
@@ -530,6 +817,12 @@ The following records the choices agreed in discussion and the alternatives they
 | Bound worker concurrency and separate heartbeats from handlers | Prevents leased work from waiting behind an unbounded local queue and prevents slow handlers from starving renewal. Two workers with two slots each demonstrate parallel execution. | Higher concurrency can improve throughput but increases database/downstream pressure. Tune capacity and connection budgets together rather than merely adding threads. |
 | Poll for advancement and recovery with configurable intervals | Keeps durable scheduling simple without introducing a broker or worker registry. | Polling adds latency and database traffic; shorter intervals trade load for responsiveness. Notifications or different delivery mechanisms remain future options if measurements justify them. |
 | Drain on shutdown, then cancel locally and let leases expire | Gives in-flight attempts a chance to finish while bounding orderly shutdown time. | Immediate shutdown creates avoidable abandoned attempts; unlimited draining can block deployment indefinitely. External actions may continue after cancellation. |
+| Keep `actionType` and pre-register Java handlers initially | Meets the assignment's per-step type/action requirement and provides simple, deterministic dispatch. Supported handlers are a predefined deployment set; the orchestration engine treats their names as opaque references. | Removing the field alone leaves behavior selection undefined. Arbitrary handlers without registration may be supported through a future execution adapter, but need a target/resolution protocol; they are not part of v1. |
+| Use synchronous handlers with JSON-object inputs and outputs | Fits bounded worker execution and PostgreSQL JSON storage without coupling the engine to a Java DTO for every action. Direct dependency outputs make data flow explicit. | Handler-level validation is required; typed per-action contracts, expression-based binding, and asynchronous handler APIs add complexity and are deferred. |
+| Distinguish retryable and permanent handler failures | Transient failures receive bounded retries; known permanent errors fail promptly and remain visible in history through their classification. | Retrying every failure is simpler but wastes allowance on deterministic errors. Explicit classification broadens the terminal trigger beyond retry exhaustion; unknown ordinary exceptions remain retryable and bounded. |
+| Persist effective retry defaults at submission | Per-step overrides are easy to understand, while application configuration changes cannot silently alter running executions or manual retry cycles. | Looking up current defaults on every claim would make execution depend on deployment changes. |
+| Use execution resources, separate history endpoints, and cursor pagination | Aligns the API with the persisted execution/cycle/attempt model, keeps routine status responses manageable, and supports growing history without large offsets. | Pages are not frozen snapshots. Definition management and a single combined unbounded history response are unnecessary initially. |
+| Publish a structural submission schema and apply semantic validation separately | Clients can check types and required fields while the application validates registry membership, DAG constraints, handler parameters, and effective policy. | Encoding registered action names as a schema enum would require schema edits whenever a handler is added. Schema defaults are annotations, not runtime normalization. |
 | Keep the first release focused on must-have behavior | Correct execution, recovery, and reproducible verification take priority within the assignment's time constraints. | Additional infrastructure, dashboards, and advanced workflow features increase scope before the execution model is verified. |
 
 As detailed decisions are made, extend this record with the selected behavior, reasons, alternatives considered, and consequences. Keep proposals and unresolved questions distinct from agreed decisions.
@@ -546,6 +839,8 @@ As detailed decisions are made, extend this record with the selected behavior, r
 | Availability | One application/coordinator process and one database instance. | Separate application roles and introduce database high availability and backup/recovery procedures when deployment requirements justify them. |
 | Task delivery | Database polling without a broker. | Consider notifications or a broker if measured discovery latency or polling load becomes unacceptable. Any change must preserve durable handoff and claim/fencing guarantees. |
 | Reusable definitions and recurring execution | Immutable definition JSON on each submitted execution; no separate definition or schedule table. | Add reusable definitions/versions and schedule records when recurring execution is introduced. Each scheduled occurrence creates an execution with its own snapshot and inputs. Separate definitions are useful for reuse, though recurring execution does not strictly require them. |
+| Arbitrary execution implementations | Predefined Java handlers registered at startup; `actionType` selects a handler consistently across API and workers. | Support arbitrary or externally supplied implementations without pre-registration through a separately designed execution adapter/resolution protocol. Preserve ownership, fencing, and retry behavior; the execution target, compatibility, and version identity need explicit design. |
+| HTTP command deduplication | Submission creates a new execution on each accepted POST; retry operates on current workflow state. | Add durable HTTP idempotency keys if clients need safe automatic resubmission after lost responses. This is distinct from downstream business-operation idempotency. |
 
 Prioritize future work by observed constraints: first measure scheduling latency, query load, lock contention, and worker utilization; then tune database access and worker capacity; then separate or replicate runtime roles. Introduce partitioning, new storage, or a broker only when simpler changes are insufficient. Database durability and availability requirements may independently justify earlier operational improvements.
 
@@ -553,15 +848,13 @@ PostgreSQL remains a shared throughput and availability dependency. More workers
 
 Optional product capabilities remain deferred: cancellation, compensation, workflow versioning, conditional execution, recurring schedules, user-configurable execution timeouts, an administrative UI, and advanced metrics/tracing. Basic diagnostic logs and useful errors are part of the initial implementation.
 
-## Open design decisions
+## Remaining implementation details and deferred decisions
 
-Before implementing the affected behavior, settle and record:
+The previously listed handler contract, retry defaults, API routes/payloads, coordination behavior, and worker operating defaults are recorded above. There are no remaining open items from that discussion list. The submission schema is part of the design contract; it is not an implemented API or a substitute for runtime semantic validation.
 
-1. The Java handler contract, input/output representation, dependency-output access, and error classification, including whether some failures are non-retryable.
-2. API defaults for attempt limits and initial/maximum backoff delays. Attempt counting, capped exponential backoff, fresh per-cycle allowances, and treatment of abandoned attempts are settled above.
-3. API routes, payloads, error responses, and listing/history pagination, including how clients inspect cycles and distinguish failed workflows with still-running attempts.
+Implementation still needs concrete SQL and migrations, Java/dependency versions, framework/driver timeout settings, executor/connection sizing, opaque cursor encoding, predefined demo-handler implementations, and race-case verification. These are implementation tasks governed by the recorded behavior, not authorization to begin the next milestone or to select a different architecture implicitly.
 
-The former coordination and worker-runtime discussion items are settled in **Database coordination protocol** and **Worker runtime and operating defaults**. Concrete SQL, framework/driver timeout settings, executor/connection sizing, and race-case verification remain implementation tasks governed by those decisions, not authorization to begin implementation. No coordination alternative is selected implicitly by an implementation convenience.
+Arbitrary execution without predefined registration, reusable definitions/schedules, workflow-code versioning, and HTTP idempotency keys remain deferred capabilities with the trade-offs recorded above. Design their execution and compatibility semantics before introducing them.
 
 ## Verification plan
 
@@ -586,7 +879,12 @@ Specific persistence and lifecycle scenarios include:
 - Saturate handler capacity without starving heartbeats, bound in-flight claims, and retain capacity for handlers that ignore interruption. Use controllable test handlers so tests themselves cannot hang indefinitely.
 - Verify orderly shutdown stops new claims, renews during draining, and relinquishes unfinished attempts after the configured drain period.
 - Test invalid configuration and timeout-budget enforcement. Recovery timing tests should allow scheduling tolerance and distinguish expiry detection from backoff and replacement execution.
+- Validate submission-schema syntax, representative accepted/rejected payloads, and agreement between schema annotations and application defaults. Separately test semantic cases that a structural schema accepts, including cycles, duplicate IDs, unsupported actions, and inconsistent effective backoff.
+- Reject duplicate handler registrations and unknown submitted action types; invoke the correct predefined handler without business-specific coordinator branches. Verify repeated use of one action type in independent DAG nodes.
+- Verify direct dependency output access, JSON-object result enforcement, isolated invocation inputs, and stable logical idempotency keys across attempts and manual retry cycles.
+- Exercise retryable, permanent, unexpected, and cancellation outcomes. Permanent failures must terminate immediately, retain classification in attempt history, and apply the same waiting/running-step policy as exhausted retries.
+- Verify submission receipts, `Location`, status/step results, cycle/attempt history, filter validation, keyset ordering, cursor binding, and consistent error envelopes. A failed workflow with running attempts must expose that state and reject manual retry.
 
 Run focused tests during implementation and the full Maven suite at milestone boundaries. Verify Docker Compose startup and sample workflows from a fresh clone. These are planned checks, not results already achieved. Multi-coordinator operation and additional infrastructure require their own verification before being presented as supported.
 
-This document records architecture, persistence, lifecycle, coordination, and worker-runtime decisions only. It does not complete the remaining detailed design or authorize the next implementation milestone.
+This document records design decisions and intended contracts only; it does not establish that they have been implemented or verified. Documentation review does not authorize the next implementation milestone.
