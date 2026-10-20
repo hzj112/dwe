@@ -18,6 +18,8 @@ PostgreSQL stores workflow executions, retry cycles, steps, dependency edges, an
 
 The database also provides durable work discovery. Keeping readiness, ownership, results, and lifecycle transitions in one transactional system avoids a separate database-to-broker delivery protocol. Workers pull eligible steps rather than receiving an in-memory assignment that could disappear during a restart.
 
+This makes database reachability an availability dependency. The [network partitions and CAP tradeoff](#network-partitions-and-cap) explains which operations pause when components cannot reach that authority.
+
 ### Claims, leases, and fencing
 
 Claims and workflow lifecycle changes use short transactions guarded by the workflow row, with conditional updates and consistent workflow-before-step lock ordering. This coordinates claims with failure, completion, recovery, and manual retry. A claim rechecks workflow status, dependency completion, eligibility time, and remaining allowance, then atomically records ownership and an attempt. Candidate discovery alone grants no ownership.
@@ -64,13 +66,35 @@ These comparisons record design discussions, including the retrospective in [tra
 
 ## Tradeoffs
 
-- **Correctness and simplicity over peak throughput:** workflow-row guards make cross-step decisions straightforward, but serialize short state transitions within one workflow. Handlers and separate workflows still run concurrently.
-- **Consistent ownership over availability during partitions:** scheduling and durable transitions require PostgreSQL. A disconnected worker cannot safely continue renewing or reporting indefinitely; database loss pauses progress.
-- **Fewer infrastructure components at the cost of polling:** one transactional authority simplifies local verification and recovery, while polling adds database traffic and discovery latency.
-- **At-least-once execution with bounded retries:** fencing protects engine records, but cannot stop every stale handler or deduplicate external effects. A handler may act externally before its result is lost and later be retried. Handlers must implement business-level idempotency; the stable key alone does not enforce it.
-- **Resume successful work rather than refresh it:** manual retry saves work and preserves outputs, assuming those outputs remain valid. Changed inputs or a full refresh require a new execution.
-- **Bounded worker capacity and cooperative cancellation:** reserving slots prevents unbounded leased queues. A handler that ignores interruption keeps its slot until it exits; a healthy handler can renew indefinitely because execution timeouts are not implemented.
-- **Inspectable history with ongoing storage cost:** attempts and cycles survive retries/restarts, but history and JSON payloads have no application-level retention or size limits. History is not an event log of every intermediate state change.
+### Correctness and simplicity over peak throughput
+
+Workflow-row guards give claims, failure, recovery, and manual retry one coordination point, making cross-step rules easier to verify. The cost is that short state-changing transactions within the same workflow serialize, even when they concern different steps. Business handlers run outside those transactions, so independent steps and separate workflows still execute concurrently. Adding workers alone cannot remove contention on a busy workflow; finer-grained coordination would need evidence that its extra complexity is worthwhile.
+
+### Network partitions and CAP
+
+During a partition, we prioritize consistent ownership and durable state over availability of database-dependent operations. Disconnected workers cannot independently authorize claims or extend ownership without confirmed renewal; their local deadline triggers best-effort cancellation. Database-connected components may continue, while complete database isolation pauses durable coordination. Returning `503` does not satisfy CAP availability. [AWS CAP discussion](https://docs.aws.amazon.com/whitepapers/latest/availability-and-beyond-improving-resilience/cap-theorem.html)
+
+This is an application-level policy around one PostgreSQL authority, with no database replicas, quorum protocol, or automatic failover. CAP consistency means single-copy, linearizable behavior, not merely valid records; protecting our execution invariants does not establish a blanket CP classification or a linearizable contract for every API. See [Failure Modes](#failure-modes) for recovery behavior and the execution-semantics tradeoff below for external-effect limitations.
+
+### Fewer infrastructure components at the cost of polling
+
+Using PostgreSQL for both execution state and work discovery avoids operating a separate broker and coordinating database writes with message publication. Pending work and retry schedules remain discoverable after application restarts. The cost is repeated polling queries and a delay between work becoming eligible and a worker finding it. Shorter intervals reduce that delay but increase database load; a broker or notification mechanism should follow measured need and preserve authoritative claim checks.
+
+### At-least-once execution with bounded retries
+
+Retrying expired or unsuccessful attempts allows progress after worker and connectivity failures, but can repeat business work. A handler may act externally before its result is lost, and fencing cannot undo that effect or stop every stale handler. Handlers must implement business-level idempotency where the effect occurs; the stable execution/step key alone does not enforce it. Retry allowances bound repeated execution, but counting abandoned claims means an allowance can be exhausted without a confirmed business failure.
+
+### Reusing completed outputs versus refreshing work
+
+Manual retry preserves completed outputs and reruns failed steps in a new cycle, avoiding repeated upstream work and retaining the original execution history. Inputs and effective policies remain unchanged, so retry resumes the same submitted configuration. The cost is assuming that saved outputs and any associated external state remain valid; the engine does not check freshness or repeat successful business effects. Changed inputs, refreshed outputs, or a complete rerun require a new execution.
+
+### Bounded worker capacity and cooperative cancellation
+
+Workers reserve execution slots before claiming, so leases are not consumed by work waiting in an unbounded local queue. Excess work remains in PostgreSQL for another available worker or a later poll, while separate control executors keep heartbeats independent of handler threads. The cost is that a handler ignoring interruption retains its slot until it exits; cancellation does not guarantee immediate capacity recovery. A healthy handler can renew indefinitely because ownership leases are not execution timeouts, and execution deadlines are not implemented.
+
+### Inspectable history with ongoing storage cost
+
+Keeping attempts and cycles separate from current step state preserves failures, abandonment, results, and manual-retry history across restarts. Paginated APIs make that history inspectable without returning it all in each status response. The cost is ongoing storage and index maintenance; pagination bounds collection length, but history retention and individual JSON payload sizes have no application-level limits. This history records attempts and cycles, not an audit event for every intermediate state change. Archival or external result storage would need rules that preserve data still required by active executions and retries.
 
 ## Failure Modes
 
