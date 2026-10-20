@@ -1,7 +1,7 @@
 # Engineering Instructions
 
 ## Project
-Build a reliable distributed DAG workflow engine using Java, Maven, Spring Boot, PostgreSQL, and Docker Compose. Follow `PROJECT_CONTEXT.md` and the approved architecture. Prioritize correctness, simplicity, and maintainability within the assignment's time constraints.
+Build a reliable distributed DAG workflow engine using Java, Maven, Spring Boot, PostgreSQL, and Docker Compose. Follow `PROJECT_DESCRIPTION.md` and the approved architecture. Prioritize correctness, simplicity, and maintainability within the assignment's time constraints.
 
 ## Engineering Principles
 - Prefer simple, focused implementations; avoid unnecessary abstractions, dependencies, and premature optimization.

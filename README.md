@@ -40,6 +40,31 @@ docker-compose down
 
 `down` retains the named PostgreSQL volume and stored executions. Removing that volume deletes their state. This deployment is intended for local evaluation and has no authentication.
 
+### Build and run with observability (optional)
+
+Use the Compose overlay to include Prometheus and the provisioned Grafana dashboard. The same Maven verification above applies to both deployments:
+
+```sh
+docker compose -f docker-compose.yml -f compose.observability.yml up --build -d --wait
+docker compose -f docker-compose.yml -f compose.observability.yml ps
+```
+
+The workflow API remains at `http://localhost:8080`. Open the [Grafana dashboard](http://localhost:3000/d/dwe-overview) and [Prometheus](http://localhost:9090) to inspect backlog, capacity, attempt outcomes, recovery, and alerts. Monitoring ports bind to loopback; anonymous Grafana viewing is enabled for local evaluation. Management endpoints move to internal port 9091 in this mode; check API readiness from inside its container:
+
+```sh
+docker compose -f docker-compose.yml -f compose.observability.yml exec api \
+  curl --fail http://localhost:9091/actuator/health/readiness
+```
+
+Keep both Compose files in subsequent commands. For logs or shutdown:
+
+```sh
+docker compose -f docker-compose.yml -f compose.observability.yml logs --tail=100 api worker
+docker compose -f docker-compose.yml -f compose.observability.yml down
+```
+
+`down` retains the database and monitoring volumes. See [OBSERVABILITY.md](OBSERVABILITY.md) for configuration, metric semantics, failure demonstrations, and cleanup details.
+
 ## Architecture Overview
 
 ```mermaid
@@ -49,11 +74,17 @@ flowchart TB
         API[REST API and validation]
         Coordinator[Workflow coordinator]
         Recovery[Expired-lease recovery]
+        APIMetrics["API metrics and cached DB sampler"]
     end
     DB[(PostgreSQL: execution state and history)]
     subgraph Workers[Separate worker processes]
         W1[Worker 1: leases and Java handlers]
         W2[Worker 2: leases and Java handlers]
+        WorkerMetrics["Metrics endpoint in each worker"]
+    end
+    subgraph Monitoring["Optional observability add-ons"]
+        Prometheus["Prometheus: metric history and alerts"]
+        Grafana["Grafana: operational dashboard"]
     end
     Client -->|Submit, inspect, retry| API
     API <-->|Persist and query| DB
@@ -61,19 +92,21 @@ flowchart TB
     Recovery <-->|Settle expired attempts and schedule retries| DB
     W1 <-->|Claim, renew, report| DB
     W2 <-->|Claim, renew, report| DB
+    APIMetrics -.->|Periodic aggregate queries| DB
+    Prometheus -.->|Scrape API metrics| APIMetrics
+    Prometheus -.->|Scrape each worker| WorkerMetrics
+    Grafana -.->|Query metric history| Prometheus
+    Client -.->|View dashboard| Grafana
+    classDef addon fill:#f5f3ff,stroke:#7c3aed,color:#4c1d95,stroke-dasharray:6 4
+    class APIMetrics,WorkerMetrics,Prometheus,Grafana addon
+    style Monitoring fill:#faf5ff,stroke:#7c3aed,stroke-dasharray:6 4
 ```
 
 The API validates and persists submissions. The workflow coordinator makes steps eligible after all dependencies complete and finalizes successful workflows. Workers compete for atomic database claims and run registered business handlers outside transactions. Recovery settles expired attempts and applies persisted retry policies. PostgreSQL is both the durable state store and work queue; no separate broker is required.
 
 One Maven artifact runs with either the `api` or `worker` profile. Compose starts two workers with two handler slots each, allowing up to four concurrent handlers. Leases and fencing reject stale state writes. Execution is **at least once**, subject to retry limits: handlers must deduplicate external effects, using the stable execution/step idempotency key where appropriate.
 
-### Optional monitoring dashboard
-
-```sh
-docker compose -f docker-compose.yml -f compose.observability.yml up --build -d --wait
-```
-
-Open the provisioned [Grafana dashboard](http://localhost:3000/d/dwe-overview) and [Prometheus](http://localhost:9090). The dashboard shows work waiting, worker capacity, execution outcomes, control-loop activity, ownership/recovery, database pressure, and alerts. Monitoring ports bind to loopback; management endpoints remain inside the container network. Ordinary startup stays unchanged. See [OBSERVABILITY.md](OBSERVABILITY.md) for configuration, metric semantics, the failure walkthrough, and cleanup instructions. Local anonymous Grafana viewing is enabled for this evaluation deployment.
+**Purple dashed boxes and dotted connections identify optional observability components.** The API's sampler caches aggregate database observations; Prometheus reads that cache and process metrics through management endpoints, scraping each worker independently. Grafana queries Prometheus for visualization. These components observe execution; workflow progress does not depend on Prometheus or Grafana.
 
 ## Example Usage
 
@@ -183,3 +216,19 @@ python3 scripts/verify-provider-demo.py
 | `verify-provider-demo.py` | Provider report/cleaned-data export, re-export without resubmission, transient validation failure/backoff, and worker death/lease recovery with identical business results. Add `--observability --keep` to inspect a retained monitored demo. |
 
 Scripts need no third-party Python packages. Each builds a temporary image and isolated Compose project with disposable ports/storage, then cleans up its own resources. Delivery, observability, and provider-demo checks use ordinary engine defaults; recovery/retry/history fixtures shorten timings. The observability and provider-demo scripts' explicit `--keep` options retain successful stacks for inspection. Allow several minutes, plus initial downloads. Run the full command sequence from a fresh checkout for delivery verification.
+
+## Milestones
+
+The following milestones are complete. See [Milestones.md](Milestones.md) for detailed scope, acceptance criteria, verification records, and the remaining optional roadmap.
+
+| Milestone | Delivered capability |
+| --- | --- |
+| 1 — Design phase | Architecture, contracts, state model, coordination invariants, and tradeoffs. |
+| 2 — Minimal end-to-end implementation | Submission APIs, durable state, registered handlers, and sequential execution. |
+| 3 — Parallel DAG execution | Concurrent branches, dependency joins, and competing workers. |
+| 4 — Crash recovery | Lease expiry, fencing, worker replacement, and connectivity-failure handling. |
+| 5 — Automatic and manual retries | Persisted backoff, retry limits, retry cycles, and preservation of completed work. |
+| 6 — Listing and history APIs | Paginated execution, cycle, and attempt inspection. |
+| 7 — Reproducible delivery | Compose deployment, runnable examples, and restart/persistence verification. |
+| 10a — Observability and failure diagnosis | Optional metrics, structured logs, Prometheus/Grafana, alerts, and fault walkthroughs. |
+| Final application demo — Provider records validation | Business handlers plus an external report/export client, with retry and crash demonstrations. |

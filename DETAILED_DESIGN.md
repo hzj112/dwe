@@ -10,7 +10,7 @@ Milestone 10a's optional management listeners, instrumentation, database sampler
 
 | Topic | Sections |
 | --- | --- |
-| Components and execution flow | [Architecture](#architecture), [End-to-end flow](#end-to-end-flow) |
+| Components and execution flow | [Architecture](#architecture), [Optional observability](#optional-observability-deployment), [End-to-end flow](#end-to-end-flow) |
 | Execution and client contracts | [Java handlers](#java-handler-contract-and-registration), [Retry defaults](#retry-policy-defaults), [REST API](#rest-api-contract) |
 | Durable state | [Persistence model](#persistence-model), [Execution lifecycle](#execution-lifecycle) |
 | Distributed coordination | [Database coordination protocol](#database-coordination-protocol), [Worker runtime](#worker-runtime-and-operating-defaults) |
@@ -31,6 +31,8 @@ flowchart TB
         Coordinator["Background workflow coordinator"]
         Recovery["Background lease recovery coordinator"]
         Persistence["Persistence and coordination layer"]
+        Sampler["Optional read-only DB sampler"]
+        APIMetrics["Optional API management endpoint<br/>Process metrics and cached observations"]
 
         API --> Validator
         Validator --> Persistence
@@ -39,12 +41,18 @@ flowchart TB
         Recovery --> Persistence
     end
 
-    DB[("PostgreSQL\nDefinitions, inputs, execution state,\nresults, leases, and attempt history")]
+    DB[("PostgreSQL<br/>Definitions, inputs, execution state,<br/>results, leases, and attempt history")]
 
     subgraph Workers["Long-running worker processes"]
-        W1["Worker 1\nStep handlers"]
-        W2["Worker 2\nStep handlers"]
-        WN["Worker N\nStep handlers"]
+        W1["Worker 1<br/>Step handlers"]
+        W2["Worker 2<br/>Step handlers"]
+        WN["Worker N<br/>Step handlers"]
+        WorkerMetrics["Optional management endpoint<br/>in each worker process"]
+    end
+
+    subgraph Monitoring["Optional observability add-ons — Compose overlay"]
+        Prometheus["Prometheus<br/>Metric history and alert evaluation"]
+        Grafana["Grafana<br/>Provisioned dashboard"]
     end
 
     Client -->|"Submit, query, list, retry"| API
@@ -52,9 +60,23 @@ flowchart TB
     W1 <-->|"Claim, renew lease, record outcome"| DB
     W2 <-->|"Claim, renew lease, record outcome"| DB
     WN <-->|"Claim, renew lease, record outcome"| DB
+    Sampler -.->|"Bounded read-only aggregate queries"| DB
+    Sampler -.->|"Cached snapshot and freshness"| APIMetrics
+    W1 -.->|"Local process observations"| WorkerMetrics
+    W2 -.->|"Local process observations"| WorkerMetrics
+    WN -.->|"Local process observations"| WorkerMetrics
+    Prometheus -.->|"Scrape API management :9091"| APIMetrics
+    Prometheus -.->|"Discover and scrape each worker :9091"| WorkerMetrics
+    Grafana -.->|"Query metric history and alert state"| Prometheus
+    Client -.->|"View dashboard"| Grafana
+    classDef addon fill:#f5f3ff,stroke:#7c3aed,color:#4c1d95,stroke-dasharray:6 4
+    class Sampler,APIMetrics,WorkerMetrics,Prometheus,Grafana addon
+    style Monitoring fill:#faf5ff,stroke:#7c3aed,stroke-dasharray:6 4
 ```
 
 These boxes are logical responsibilities, not a requirement for separate services. The outer application box initially contains both the REST API server and the continuously running coordinator. The REST API box itself represents request handling only. Workflow execution continues independently of the HTTP request that submitted it.
+
+**Purple dashed boxes and dotted connections identify optional observability components and interactions.** The worker-management box represents one endpoint per worker, not a shared metrics service. The sampler and API management endpoint run within the API process; Prometheus and Grafana are separate containers enabled by the monitoring overlay.
 
 ### Components
 
@@ -68,6 +90,10 @@ These boxes are logical responsibilities, not a requirement for separate service
 | Step handlers | Implement supported Java business actions. Receive workflow inputs, step parameters, and completed dependency outputs; return results or report failures. Do not own orchestration or task-claim logic. |
 | Persistence and coordination layer | Provide shared database operations and transactional rules for submission, eligibility, ownership, lease renewal, results, retries, history, and workflow finalization. Both the application and worker runtimes use this code. |
 | PostgreSQL | Persist workflow definitions and inputs, workflow and step states, results, attempt history, retry schedules, and ownership information. Coordinate competing processes through atomic database operations. |
+| Process instrumentation and management endpoints (optional exposure) | Micrometer records local operation durations, events, capacity, and loop activity; each process exposes its own metrics through Actuator in monitoring mode. Structured lifecycle logs carry execution identities. |
+| Database sampler (optional) | Read aggregate durable state on a separate thread and one-connection read-only pool, cache the results, and expose freshness/success. Metrics scrapes read memory rather than run SQL. |
+| Prometheus (optional) | Scrape the API and every worker independently, retain timestamped metrics, and evaluate recording/alert rules. |
+| Grafana (optional) | Query Prometheus and display the provisioned operational dashboard. |
 
 ### Initial deployment
 
@@ -78,6 +104,18 @@ These boxes are logical responsibilities, not a requirement for separate service
 - Docker Compose starts the application, workers, and database.
 
 Runtime roles should remain separable so that API-only and coordinator-only deployments can be introduced later. Separate repositories or independently developed microservices are unnecessary initially.
+
+### Optional observability deployment
+
+The [Compose overlay](compose.observability.yml) enables the `observability` profile on the same application image and adds Prometheus and Grafana with separate monitoring volumes. It is an optional operating configuration; the ordinary deployment retains the API/coordinators, workers, and PostgreSQL without these extra containers or the sampler.
+
+In monitoring mode, Actuator health and metrics use internal port 9091. Workers expose only this management listener; the API's business routes remain on port 8080. Prometheus scrapes `/actuator/prometheus` every five seconds and discovers worker replicas individually. Grafana and Prometheus are published on loopback ports 3000 and 9090 by default; application management ports are not published.
+
+The API sampler runs two aggregate SELECTs in a read-only repeatable-read transaction, then waits five seconds before collecting again. Separate connection/query budgets bound stages of collection. A successful sample replaces the cached snapshot; failure retains the preceding values with an explicit failure flag and unchanged last-success timestamp. Queue/lease panels and related alerts require fresh observations, so unavailable data is not interpreted as zero backlog. Database observations use PostgreSQL time to account for retry eligibility and lease expiry without new writes.
+
+Process metrics are best effort and durable history remains authoritative. Lifecycle events are emitted after newly applied transactions commit; rollbacks and duplicate reports do not add completion events. Prometheus/Grafana availability is not required for workflow execution, although aggregate sampling still adds load to the shared database. Logs remain in application/container output; centralized log storage, distributed tracing, and external alert delivery are outside this deployment.
+
+See [OBSERVABILITY.md](OBSERVABILITY.md) for exact metrics, freshness conditions, collection budgets, alert thresholds, operating commands, and failure demonstrations. Replicating the API would require deliberate sampler placement and separate per-instance scraping; the current monitoring configuration assumes one API process.
 
 ## End-to-end flow
 
