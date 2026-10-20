@@ -2,7 +2,7 @@
 
 ## Status and review boundary
 
-Current status: milestones 2–6 are committed, latest `a12f473`; milestone 7 final verification is complete, with delivery changes uncommitted for review. The environment observations, proposed implementation tree, and earlier checkpoint statements below are historical records. Current behavior and commands are described in README.md and DESIGN.md; Milestones.md governs the roadmap.
+Current status: core milestones 1–7 are complete, with milestone 7 committed as `c403b14`. The separately approved observability/failure-diagnosis sub-milestone 10a is recorded in [Milestones.md](Milestones.md) and [OBSERVABILITY.md](OBSERVABILITY.md). The environment observations, proposed implementation tree, and earlier checkpoint statements below are historical records. Current behavior and commands are described in README.md and DESIGN.md; Milestones.md governs the roadmap.
 
 Prepared on 2026-10-17 (America/New_York) for review before application code generation, with environment results updated after Docker Desktop was started. Milestone 2 was subsequently authorized and implemented. The environment-validation sections below preserve the observations made before implementation; the checkpoint records the newer project-specific results. No global shell-profile changes have been made.
 

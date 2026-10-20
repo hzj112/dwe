@@ -6,7 +6,7 @@ Design references: [high-level design](DESIGN.md) and [Detailed Design](DETAILED
 
 ## Status and Priorities
 
-Milestone 1 records the design work completed before implementation. Milestones 2–7 are implemented and committed, with milestone 7 committed as `c403b14`. Optional milestones 8–21 have not started.
+Milestone 1 records the design work completed before implementation. Milestones 2–7 are implemented and committed, with milestone 7 committed as `c403b14`. The separately approved optional sub-milestone 10a adds observability and failure diagnosis; its checkpoint is below. Other optional milestones and the remaining scope of milestone 10 have not started.
 
 Priority order:
 
@@ -154,6 +154,28 @@ This establishes the recorded local verification boundary, not production load c
 ## Optional Milestones 8–21
 
 These are proposed extensions, not requirements for submission. Each receives its own focused design before implementation, particularly where states or public contracts change. Their original numbering and order are retained for discussion.
+
+### Milestone 10a — Observability and Failure Diagnosis
+
+**Outcome:** A reviewer can inspect a provisioned dashboard, distinguish capacity pressure from worker loss, database failure, and stalled coordination, and verify recovery against durable history.
+
+**Scope:**
+
+- Add best-effort process metrics and structured lifecycle events, with bounded labels and commit-aware transition accounting.
+- Sample durable state through periodic read-only aggregates using a separate bounded connection pool/thread; cache results and expose freshness/errors.
+- Add an optional Compose overlay with internal management endpoints, independent worker discovery, Prometheus, Grafana provisioning, and tested alert rules. Keep ordinary startup and public API contracts unchanged.
+- Provide a dashboard/runbook and isolated scenarios for saturation, worker death, coordinator stall with UP health, database outage, monitoring outage, and scale-out discovery.
+- Verify rollback/duplicate/stale-result accounting, time-derived eligibility, cached reads during query failure, and monitoring failure isolation.
+
+**Acceptance:** A fresh monitored deployment provisions its dashboard without manual setup, discovers each worker separately, suppresses stale queue observations, and exposes actionable failure signals. Monitoring failure does not stop workflow execution. Existing execution/lease/retry invariants continue to pass.
+
+**Status:** Implemented and locally verified on 2026-10-19. Clean Maven verification passed 60 unit tests and 113 PostgreSQL integration tests without failures/errors/skips. Prometheus configuration and fresh/stale alert-rule tests passed. The isolated observability script passed provisioning, independent scrapes, saturation, worker death/replacement, stalled promotion with UP API health and a firing progress alert, database pause/stale-data suppression/alerting, monitoring-backend outage isolation, and three-worker discovery. The original delivery script also passed ordinary Compose startup, examples, and application/database/container recreation persistence. The Grafana dashboard was visually inspected, and all 25 dashboard expressions executed successfully against Prometheus.
+
+**Findings and limits:** Successful coordinator passes can skip locked workflows, so a persistent awaiting-promotion alert checks progress independently of loop activity. Retained metric gauge suppliers prevent worker capacity from becoming NaN after garbage collection. The small demonstration workload showed an approximately 16ms p95 histogram estimate for successful database collection; this is not a load benchmark or production SLO. Counter crash gaps, sampling lag, Compose-specific deployment, and the single designated sampler assumption are documented in the runbook. No later milestone has started.
+
+**Boundary:** This is the approved observability subset of milestone 10, using in-memory instrumentation plus aggregate database sampling. No summary tables, CDC, event-projection pipeline, distributed tracing, centralized logs, external notifications, backup/restore, or Kubernetes deployment are introduced. These remain separately scoped follow-ups. See [OBSERVABILITY.md](OBSERVABILITY.md).
+
+### Optional roadmap
 
 | Milestone | Features and improvements | Completion evidence |
 | --- | --- | --- |

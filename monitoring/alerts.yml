@@ -1,0 +1,41 @@
+groups:
+  - name: workflow-engine
+    rules:
+      - record: dwe:database_sample_fresh
+        expr: (dwe_database_sample_success == 1) and (time() - dwe_database_sample_last_success_timestamp_seconds < 15)
+      - alert: DatabaseObservationsUnavailable
+        expr: (dwe_database_sample_success == 0) or (time() - dwe_database_sample_last_success_timestamp_seconds > 15)
+        for: 15s
+        annotations:
+          summary: Database observations are unavailable or stale
+          description: Check API/database connectivity. Cached queue values are not current; see OBSERVABILITY.md.
+      - alert: ReadyWorkWaiting
+        expr: (dwe_steps_oldest_ready_seconds > 30) and on(job,instance) dwe:database_sample_fresh
+        for: 15s
+        annotations:
+          summary: Eligible work has waited over 30 seconds
+          description: Compare worker capacity, target discovery and claim errors; see OBSERVABILITY.md.
+      - alert: ExpiredClaimsWaiting
+        expr: (dwe_leases_oldest_expired_seconds > 15) and on(job,instance) dwe:database_sample_fresh
+        for: 15s
+        annotations:
+          summary: Expired claims are not being recovered promptly
+          description: Inspect recovery activity and database-control errors; see OBSERVABILITY.md.
+      - alert: DependencyPromotionWaiting
+        expr: (dwe_steps_awaiting_promotion > 0) and on(job,instance) dwe:database_sample_fresh
+        for: 30s
+        annotations:
+          summary: Dependency-ready work is not being promoted
+          description: Inspect coordinator activity and workflow/step locks. Successful passes may skip busy workflows; see OBSERVABILITY.md.
+      - alert: ControlLoopOverdue
+        expr: dwe_loop_age_seconds > 30
+        for: 15s
+        annotations:
+          summary: Coordinator or recovery loop has not succeeded recently
+          description: Check loop errors and database locks/connectivity. An UP health endpoint does not prove workflow progress.
+      - alert: EngineApiUnreachable
+        expr: up{job="dwe-api"} == 0
+        for: 15s
+        annotations:
+          summary: API management endpoint is unreachable
+          description: Check process availability before interpreting missing database observations; see OBSERVABILITY.md.

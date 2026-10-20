@@ -1,0 +1,25 @@
+spring:
+  main:
+    web-application-type: servlet
+management:
+  server:
+    port: 9091
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,db
+logging:
+  structured:
+    format:
+      console: logstash
+observability:
+  database-enabled: true
+  sample-interval: 5s
+  query-timeout: 500ms

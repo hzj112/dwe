@@ -6,12 +6,14 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
 import com.athenahealth.dwe.config.EngineProperties;
 import com.athenahealth.dwe.domain.StepClaim;
 import com.athenahealth.dwe.persistence.WorkflowStore;
+import com.athenahealth.dwe.observability.EngineTelemetry;
 
 /**
  * Renews worker claims and requests cancellation before local ownership becomes unsafe.
@@ -23,11 +25,18 @@ public class LeaseManager implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(LeaseManager.class);
     private final WorkflowStore store;
     private final EngineProperties properties;
+    private final EngineTelemetry telemetry;
     private final ScheduledExecutorService heartbeats;
     private final ScheduledExecutorService deadlines;
     private final Set<Handle> handles = ConcurrentHashMap.newKeySet();
 
     public LeaseManager(WorkflowStore store, EngineProperties properties) {
+        this(store, properties, EngineTelemetry.disabled());
+    }
+
+    @Autowired
+    public LeaseManager(WorkflowStore store, EngineProperties properties, EngineTelemetry telemetry) {
+        this.telemetry = telemetry;
         this.store = store;
         this.properties = properties;
         heartbeats = Executors.newScheduledThreadPool(properties.workerConcurrency(),
@@ -73,18 +82,19 @@ public class LeaseManager implements AutoCloseable {
 
         /** Also checks elapsed time directly, in case the scheduled deadline task has been delayed. */
         public boolean isCancelled() {
-            if (System.nanoTime() - deadline >= 0) cancel("local ownership deadline elapsed");
+            if (System.nanoTime() - deadline >= 0) cancel("deadline");
             return cancelled.get();
         }
 
         /** Signals cancellation and interrupts the handler; the database still fences any later report. */
         public void cancel() {
-            cancel("worker shutdown or local cancellation");
+            cancel("shutdown");
         }
 
         /** Logs the first ownership loss once; cancellation can never be reversed by a late heartbeat. */
         private void cancel(String reason) {
             if (cancelled.compareAndSet(false, true)) {
+                telemetry.count("ownership_lost", reason);
                 log.info("Stopping local execution {} step {} attempt {}: {}",
                         claim.executionId(), claim.stepId(), claim.attemptNo(), reason);
             }
@@ -100,7 +110,7 @@ public class LeaseManager implements AutoCloseable {
 
         private synchronized void checkExpiry() {
             if (closed) return;
-            if (System.nanoTime() - deadline >= 0) cancel("local ownership deadline elapsed");
+            if (System.nanoTime() - deadline >= 0) cancel("deadline");
             else scheduleExpiry();
         }
 
@@ -117,15 +127,17 @@ public class LeaseManager implements AutoCloseable {
             long nextDelay = properties.heartbeatInterval().toMillis();
             try {
                 boolean accepted = store.renew(claim);
+                telemetry.operation("renewal", requestStarted, accepted ? "accepted" : "rejected");
                 synchronized (this) {
                     if (closed) return;
                     // Confirmation received after the previous local deadline cannot revive ownership.
-                    if (!accepted) { cancel("database rejected lease renewal"); return; }
+                    if (!accepted) { cancel("rejected"); return; }
                     if (isCancelled()) return;
                     deadline = requestStarted + properties.ownershipWindowNanos();
                     scheduleExpiry();
                 }
             } catch (RuntimeException e) {
+                telemetry.operation("renewal", requestStarted, "error");
                 log.warn("Lease renewal unavailable for execution {} step {}", claim.executionId(), claim.stepId());
                 nextDelay = Math.min(1000, properties.heartbeatInterval().toMillis());
             }

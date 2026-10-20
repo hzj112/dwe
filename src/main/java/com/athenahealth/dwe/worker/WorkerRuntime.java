@@ -6,6 +6,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.context.annotation.Profile;
@@ -15,12 +16,13 @@ import com.athenahealth.dwe.config.EngineProperties;
 import com.athenahealth.dwe.domain.StepClaim;
 import com.athenahealth.dwe.handler.*;
 import com.athenahealth.dwe.persistence.WorkflowStore;
+import com.athenahealth.dwe.observability.EngineTelemetry;
 
 import tools.jackson.databind.JsonNode;
 
 /**
  * Worker process lifecycle: polls for claims, runs handlers within a fixed capacity, and reports outcomes.
- * Spring starts and stops it through SmartLifecycle; the worker profile does not expose an HTTP server.
+ * Spring starts and stops it through SmartLifecycle; the default worker profile does not expose an HTTP server.
  */
 @Component
 @Profile("worker")
@@ -33,6 +35,7 @@ public class WorkerRuntime implements SmartLifecycle {
     private final EngineProperties properties;
     private final LeaseManager leases;
     private final Semaphore capacity;
+    private final EngineTelemetry telemetry;
     private final Set<Job> jobs = ConcurrentHashMap.newKeySet();
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor(
             Thread.ofPlatform().name("worker-poll-", 0).factory());
@@ -40,6 +43,14 @@ public class WorkerRuntime implements SmartLifecycle {
     private volatile boolean running;
 
     public WorkerRuntime(WorkflowStore store, HandlerRegistry registry, EngineProperties properties, LeaseManager leases) {
+        this(store, registry, properties, leases, EngineTelemetry.disabled());
+    }
+
+    @Autowired
+    public WorkerRuntime(WorkflowStore store, HandlerRegistry registry, EngineProperties properties,
+                         LeaseManager leases, EngineTelemetry telemetry) {
+        this.telemetry = telemetry;
+        telemetry.worker(jobs::size, properties.workerConcurrency());
         this.store = store;
         this.registry = registry;
         this.properties = properties;
@@ -60,12 +71,13 @@ public class WorkerRuntime implements SmartLifecycle {
 
     /** Reserves capacity before claiming so leases are not spent waiting behind other handler jobs. */
     private void poll() {
+        long started = System.nanoTime();
         try {
             while (running && capacity.tryAcquire()) {
                 boolean assigned = false;
                 try {
                     var claim = store.claimNext(workerId);
-                    if (claim.isEmpty()) return;
+                    if (claim.isEmpty()) { telemetry.operation("poll", started, "empty"); return; }
                     Job job = new Job(claim.get(), leases.track(claim.get()));
                     jobs.add(job);
                     try {
@@ -81,6 +93,7 @@ public class WorkerRuntime implements SmartLifecycle {
                 }
             }
         } catch (RuntimeException e) {
+            telemetry.operation("poll", started, "error");
             if (running) log.warn("Worker polling failed; will retry", e);
         }
     }
@@ -101,15 +114,18 @@ public class WorkerRuntime implements SmartLifecycle {
                 var context = new StepContext(claim, lease::isCancelled);
                 context.checkCancelled();
                 JsonNode output;
+                long handlerStarted = System.nanoTime();
                 try {
                     output = registry.get(claim.actionType()).execute(context);
                     if (output == null || !output.isObject()) {
                         throw new StepExecutionException("INVALID_OUTPUT", "Handler output must be a JSON object", false);
                     }
                 } catch (StepExecutionException e) {
+                    telemetry.operation("handler", handlerStarted, "failure");
                     report(null, e.code(), e.getMessage(), e.retryable());
                     return;
                 } catch (InterruptedException e) {
+                    telemetry.operation("handler", handlerStarted, "interrupted");
                     if (!lease.isCancelled()) {
                         Thread.interrupted();
                         report(null, "HANDLER_INTERRUPTED", "Handler execution interrupted", true);
@@ -117,10 +133,12 @@ public class WorkerRuntime implements SmartLifecycle {
                     Thread.currentThread().interrupt();
                     return;
                 } catch (Exception e) {
+                    telemetry.operation("handler", handlerStarted, "failure");
                     log.warn("Handler failed for execution {} step {}", claim.executionId(), claim.stepId(), e);
                     report(null, "HANDLER_ERROR", "Handler raised an unexpected exception", true);
                     return;
                 }
+                telemetry.operation("handler", handlerStarted, "success");
                 report(output, null, null, false);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -134,15 +152,17 @@ public class WorkerRuntime implements SmartLifecycle {
             // Retry only the persistence operation after an uncertain response, never the handler invocation.
             while (!lease.isCancelled()) {
                 try {
-                    if (output == null) store.fail(claim, code, message, retryable);
-                    else store.complete(claim, output);
+                    var result = output == null ? store.fail(claim, code, message, retryable) : store.complete(claim, output);
+                    telemetry.count("report", result.accepted() ? "recognized" : "rejected");
                     return;
                 } catch (RuntimeException e) {
+                    telemetry.count("report", "error");
                     // A committed completion can make the next heartbeat reject renewal. Read its durable
                     // outcome immediately; reconciliation is read-only and does not revive local ownership.
                     try {
                         var recorded = store.recordedOutcome(claim);
                         if (recorded.isPresent()) {
+                            telemetry.count("report", "reconciled");
                             log.info("Reconciled execution {} step {} attempt {} as {}", claim.executionId(),
                                     claim.stepId(), claim.attemptNo(), recorded.get().status());
                             return;

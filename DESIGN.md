@@ -36,6 +36,16 @@ Permanent failure or exhausted allowance atomically fails the step, current cycl
 
 Current step summaries are separate from durable attempt and cycle history. Paginated read-only APIs expose progress without advancing execution. Registered `StepHandler` implementations receive isolated JSON inputs, parameters, direct dependency outputs, and a stable execution/step idempotency key; orchestration does not depend on business action names.
 
+### Operational observability
+
+An optional Compose overlay adds Prometheus and a provisioned Grafana dashboard using the same application image. Micrometer records process capacity, operations, and lifecycle transitions; structured logs carry execution identities without adding them as metric labels. Newly applied lifecycle events are emitted after transaction commit, so rollback and duplicate reports do not inflate completion counts. Telemetry remains best effort and never replaces durable history.
+
+Only monitoring-mode API processes collect aggregate database observations. A separate single-thread sampler and one-connection read-only pool cache consistent snapshots of eligible work, pending promotion, and expired leases. Scrapes read memory. Bounded queries use database time so eligibility and expiry can change without a write. Failures retain the last snapshot with explicit freshness/success signals; stale state is hidden from queue/lease panels and their alerts. Sampling cost grows with active work and requires measurement at higher load.
+
+Monitoring-mode workers expose only an internal management listener; default workers remain non-web. The overlay, discovery, and fault tooling are Compose-specific; metric definitions and dashboard intent are reusable elsewhere. [OBSERVABILITY.md](OBSERVABILITY.md) records operating thresholds, failure diagnosis, verification, and limits.
+
+See the [detailed observability tradeoffs](tradeOffs.md#3-observability-and-failure-diagnosis-milestone-10a) for alternatives, accounting guarantees, and the distinction between health and progress.
+
 ## Alternatives Considered
 
 These comparisons record design discussions, including the retrospective in [tradeOffs.md](tradeOffs.md). They do not imply that alternatives were prototyped or benchmarked before implementation.
@@ -99,7 +109,7 @@ Priorities follow [Milestones.md](Milestones.md), with each extension requiring 
 
 1. **Safe repeated commands:** durable HTTP idempotency keys for submission/retry, including payload mismatch detection and lost-response reconciliation.
 2. **Execution deadlines:** optional per-step timeouts, explicit outcome classification, and safe late-result handling, separate from lease ownership.
-3. **Operational reliability:** structured diagnostics, metrics/alerts, readiness checks, CI verification, and tested backup/restore procedures.
+3. **Operational reliability:** milestone 10a adds local diagnostics, metrics/alerts, health probes, and a failure walkthrough. Broader CI verification, backup/restore procedures, centralized logs/tracing, and production alert delivery remain follow-ups.
 4. **Measured scaling and storage controls:** establish load baselines, improve scans/fairness and connection budgets, verify multiple API/coordinators, and add payload limits and history retention.
 5. **Developer/operator usability:** OpenAPI documentation, a convenient CLI, richer examples, and a small inspection UI.
 6. **Shared deployment security:** authentication, authorization, secrets, restricted exposure, and audit records. This is a prerequisite for any shared/public deployment, regardless of roadmap order.

@@ -4,6 +4,8 @@ This is the technical companion to the [high-level design](DESIGN.md). It preser
 
 The high-level design explains the main choices and delivery tradeoffs; this document defines the implementation details and the invariants behind them. Historical implementation checkpoints and verification records remain in [Plan.md](Plan.md) and [Milestones.md](Milestones.md).
 
+Milestone 10a's optional management listeners, instrumentation, database sampler, dashboard, alert semantics, and failure-diagnosis procedures are specified in [OBSERVABILITY.md](OBSERVABILITY.md). The base runtime and ownership protocols below remain unchanged; references to non-web workers describe the default deployment.
+
 ## Contents
 
 | Topic | Sections |
@@ -852,7 +854,7 @@ Prioritize future work by observed constraints: first measure scheduling latency
 
 PostgreSQL remains a shared throughput and availability dependency. More workers do not provide unlimited scaling, and separating runtime roles does not remove this bottleneck.
 
-Optional product capabilities remain deferred: cancellation, compensation, workflow versioning, conditional execution, recurring schedules, user-configurable execution timeouts, an administrative UI, and advanced metrics/tracing. Basic diagnostic logs and useful errors are part of the initial implementation.
+Optional product capabilities remain deferred: cancellation, compensation, workflow versioning, conditional execution, recurring schedules, user-configurable execution timeouts, an administrative UI, and distributed tracing. Milestone 10a adds the optional metrics/diagnostics dashboard described in [OBSERVABILITY.md](OBSERVABILITY.md).
 
 The prioritized follow-up roadmap is [Milestones.md](Milestones.md): first durable HTTP command deduplication and explicit execution deadlines (8–9), then operational diagnostics/backup recovery (10), measured throughput and horizontal scaling/storage growth (11–13), and usability (14). Authentication/authorization and secret management (15) must precede any shared or public deployment, regardless of roadmap numbering. Additional workflow features and execution adapters (16–21) follow separately approved designs. These priorities do not authorize further implementation automatically.
 

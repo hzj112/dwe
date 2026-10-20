@@ -102,8 +102,10 @@ def main():
         print(f'Isolated delivery checks: {check.project}; API: {check.base}', flush=True)
         try:
             # No explicit build step: a missing image must be built by the assignment's Compose up path.
-            check.compose('up', '-d', '--wait', timeout=300)
+            startup = check.compose('up', '-d', '--wait', timeout=300)
+            assert 'pull access denied for dwe' not in startup.lower(), startup
             assert len(check.compose('ps', '-q', 'worker').splitlines()) == 2
+            print('PASS missing-image startup: local build without application-image pull errors', flush=True)
             ids = verify_examples(check)
 
             payload = {'definition': {'steps': [{'id': 'only', 'actionType': 'DELAY',

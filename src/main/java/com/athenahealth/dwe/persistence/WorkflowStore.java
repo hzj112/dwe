@@ -8,12 +8,17 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+import com.athenahealth.dwe.observability.EngineTelemetry;
 
 import com.athenahealth.dwe.config.EngineProperties;
 import com.athenahealth.dwe.domain.AttemptStatus;
@@ -39,9 +44,17 @@ public class WorkflowStore {
     private final JsonMapper json;
     private final EngineProperties properties;
     private final TransactionTemplate transaction;
+    private final EngineTelemetry telemetry;
 
     public WorkflowStore(JdbcTemplate jdbc, JsonMapper json, EngineProperties properties,
                          PlatformTransactionManager manager) {
+        this(jdbc, json, properties, manager, EngineTelemetry.disabled());
+    }
+
+    @Autowired
+    public WorkflowStore(JdbcTemplate jdbc, JsonMapper json, EngineProperties properties,
+                         PlatformTransactionManager manager, EngineTelemetry telemetry) {
+        this.telemetry = telemetry;
         this.jdbc = jdbc;
         this.json = json;
         this.properties = properties;
@@ -89,6 +102,7 @@ public class WorkflowStore {
                             id, step.id(), dependency);
                 }
             }
+            observeAfterCommit("workflow_submitted", id, null, 1, 0, null, "PENDING");
             return id;
         });
     }
@@ -123,6 +137,7 @@ public class WorkflowStore {
                     UPDATE workflow_execution SET status = 'PENDING', current_cycle_no = ?, finished_at = NULL,
                         updated_at = clock_timestamp() WHERE id = ?
                     """, nextCycle, executionId);
+            observeAfterCommit("workflow_retried", executionId, null, nextCycle, 0, null, "PENDING");
             return nextCycle;
         });
     }
@@ -155,6 +170,7 @@ public class WorkflowStore {
                             UPDATE workflow_cycle SET status = 'COMPLETED', finished_at = clock_timestamp()
                             WHERE workflow_id = ? AND cycle_no = ?
                             """, id, workflow.get().cycleNo());
+                    observeAfterCommit("workflow_completed", id, null, workflow.get().cycleNo(), 0, null, "COMPLETED");
                 }
                 return null;
             });
@@ -235,6 +251,8 @@ public class WorkflowStore {
                 """, rs -> { outputs.put(rs.getString(1), json.readTree(rs.getString(2))); }, candidate.executionId(), candidate.stepId());
         StepClaim claim = new StepClaim(candidate.executionId(), candidate.stepId(), step.actionType(),
                 workflow.cycleNo(), token, workerId, workflow.inputs(), step.parameters(), outputs, requestStarted);
+        observeAfterCommit("attempt_claimed", claim.executionId(), claim.stepId(), claim.cycleNo(),
+                claim.attemptNo(), claim.workerId(), "RUNNING");
         proposed.set(claim);
         return Optional.of(claim);
     }
@@ -314,6 +332,10 @@ public class WorkflowStore {
         if (!retry && workflow.active()) {
             failWorkflow(candidate.executionId(), candidate.cycleNo(), candidate.stepId(), LEASE_EXPIRED, LEASE_EXPIRED_MESSAGE);
         }
+        observeAfterCommit("attempt_abandoned", candidate.executionId(), candidate.stepId(), candidate.cycleNo(),
+                candidate.attemptNo(), candidate.workerId(), retry ? "RETRYING" : "FAILED");
+        if (retry) observeAfterCommit("retry_scheduled", candidate.executionId(), candidate.stepId(), candidate.cycleNo(),
+                candidate.attemptNo(), candidate.workerId(), "RETRYING");
         return true;
     }
 
@@ -390,12 +412,17 @@ public class WorkflowStore {
             if (!success && !retry && workflow.active()) {
                 failWorkflow(claim.executionId(), claim.cycleNo(), claim.stepId(), code, message);
             }
+            observeAfterCommit("attempt_finished", claim.executionId(), claim.stepId(), claim.cycleNo(),
+                    claim.attemptNo(), claim.workerId(), outcome.name());
+            if (retry) observeAfterCommit("retry_scheduled", claim.executionId(), claim.stepId(), claim.cycleNo(),
+                    claim.attemptNo(), claim.workerId(), "RETRYING");
             return new ReportResult(true, outcome);
         });
     }
 
     /** Fails waiting steps; already-running attempts may finish without reopening the failed workflow. */
     private void failWorkflow(UUID executionId, int cycleNo, String failedStepId, String code, String message) {
+        observeAfterCommit("workflow_failed", executionId, failedStepId, cycleNo, 0, null, "FAILED");
         jdbc.update("""
                 UPDATE workflow_execution SET status = 'FAILED', finished_at = clock_timestamp(), updated_at = clock_timestamp()
                 WHERE id = ?
@@ -440,7 +467,23 @@ public class WorkflowStore {
                 Integer.class, id, stepId, cycleNo);
     }
 
+    private void observeAfterCommit(String event, UUID id, String stepId, int cycle, long attempt,
+                                    String worker, String outcome) {
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() { telemetry.transition(event, id, stepId, cycle, attempt, worker, outcome); }
+        });
+    }
+
     private <T> T inTransaction(Supplier<T> action) {
-        return transaction.execute(status -> action.get());
+        long started = System.nanoTime();
+        try {
+            T result = transaction.execute(status -> action.get());
+            telemetry.operation("database_control", started, "success");
+            return result;
+        } catch (RuntimeException e) {
+            telemetry.operation("database_control", started, "error");
+            throw e;
+        }
     }
 }

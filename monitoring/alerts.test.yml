@@ -1,0 +1,59 @@
+rule_files:
+  - alerts.yml
+evaluation_interval: 5s
+tests:
+  - interval: 5s
+    input_series:
+      - series: 'dwe_database_sample_success{job="dwe-api",instance="api:9091"}'
+        values: '1x20'
+      - series: 'dwe_database_sample_last_success_timestamp_seconds{job="dwe-api",instance="api:9091"}'
+        values: '0+5x20'
+      - series: 'dwe_steps_oldest_ready_seconds{job="dwe-api",instance="api:9091"}'
+        values: '45x20'
+      - series: 'dwe_steps_awaiting_promotion{job="dwe-api",instance="api:9091"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: DependencyPromotionWaiting
+        exp_alerts:
+          - exp_labels:
+              job: dwe-api
+              instance: api:9091
+            exp_annotations:
+              summary: Dependency-ready work is not being promoted
+              description: Inspect coordinator activity and workflow/step locks. Successful passes may skip busy workflows; see OBSERVABILITY.md.
+      - eval_time: 30s
+        alertname: ReadyWorkWaiting
+        exp_alerts:
+          - exp_labels:
+              job: dwe-api
+              instance: api:9091
+            exp_annotations:
+              summary: Eligible work has waited over 30 seconds
+              description: Compare worker capacity, target discovery and claim errors; see OBSERVABILITY.md.
+  - interval: 5s
+    input_series:
+      - series: 'dwe_database_sample_success{job="dwe-api",instance="api:9091"}'
+        values: '0x20'
+      - series: 'dwe_database_sample_last_success_timestamp_seconds{job="dwe-api",instance="api:9091"}'
+        values: '0x20'
+      - series: 'dwe_steps_oldest_ready_seconds{job="dwe-api",instance="api:9091"}'
+        values: '45x20'
+      - series: 'dwe_steps_awaiting_promotion{job="dwe-api",instance="api:9091"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: DependencyPromotionWaiting
+        exp_alerts: []
+      - eval_time: 30s
+        alertname: ReadyWorkWaiting
+        exp_alerts: []
+      - eval_time: 30s
+        alertname: DatabaseObservationsUnavailable
+        exp_alerts:
+          - exp_labels:
+              job: dwe-api
+              instance: api:9091
+            exp_annotations:
+              summary: Database observations are unavailable or stale
+              description: Check API/database connectivity. Cached queue values are not current; see OBSERVABILITY.md.

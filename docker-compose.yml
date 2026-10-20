@@ -18,6 +18,7 @@ services:
   api:
     image: dwe:0.1.0-SNAPSHOT
     build: .
+    pull_policy: build
     environment: &application-environment
       SPRING_PROFILES_ACTIVE: api
       DB_HOST: postgres
@@ -40,6 +41,8 @@ services:
     restart: unless-stopped
   worker:
     image: dwe:0.1.0-SNAPSHOT
+    # Reuse the image built by api; this application is not published to a registry.
+    pull_policy: never
     # Independent processes share PostgreSQL claims; each keeps its own two-handler capacity.
     deploy:
       replicas: 2

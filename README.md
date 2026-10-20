@@ -19,7 +19,7 @@ Run commands from the repository root. No host PostgreSQL installation is requir
 docker-compose up
 ```
 
-`verify` builds the application and runs unit and PostgreSQL integration tests; Docker must be available. Compose builds a missing application image and starts PostgreSQL, the API/coordinators, and two workers. `docker compose` is an equivalent command spelling. The container build supplies its own Java/Maven tools and skips tests, so run verification separately.
+`verify` builds the application and runs unit and PostgreSQL integration tests; Docker must be available. Compose builds the application image locally and starts PostgreSQL, the API/coordinators, and two workers. The API uses `pull_policy: build`; workers reuse that image with `pull_policy: never`, avoiding application-image registry pulls. Builds reuse cached layers where possible. `docker compose` is an equivalent command spelling. The container build supplies its own Java/Maven tools and skips tests, so run verification separately.
 
 Leave the foreground services running and use a second terminal for the HTTP examples.
 
@@ -66,6 +66,14 @@ flowchart TB
 The API validates and persists submissions. The workflow coordinator makes steps eligible after all dependencies complete and finalizes successful workflows. Workers compete for atomic database claims and run registered business handlers outside transactions. Recovery settles expired attempts and applies persisted retry policies. PostgreSQL is both the durable state store and work queue; no separate broker is required.
 
 One Maven artifact runs with either the `api` or `worker` profile. Compose starts two workers with two handler slots each, allowing up to four concurrent handlers. Leases and fencing reject stale state writes. Execution is **at least once**, subject to retry limits: handlers must deduplicate external effects, using the stable execution/step idempotency key where appropriate.
+
+### Optional monitoring dashboard
+
+```sh
+docker compose -f docker-compose.yml -f compose.observability.yml up --build -d --wait
+```
+
+Open the provisioned [Grafana dashboard](http://localhost:3000/d/dwe-overview) and [Prometheus](http://localhost:9090). The dashboard shows work waiting, worker capacity, execution outcomes, control-loop activity, ownership/recovery, database pressure, and alerts. Monitoring ports bind to loopback; management endpoints remain inside the container network. Ordinary startup stays unchanged. See [OBSERVABILITY.md](OBSERVABILITY.md) for configuration, metric semantics, the failure walkthrough, and cleanup instructions. Local anonymous Grafana viewing is enabled for this evaluation deployment.
 
 ## Example Usage
 
@@ -151,6 +159,7 @@ python3 scripts/verify-delivery.py
 python3 scripts/verify-recovery.py
 python3 scripts/verify-retries.py
 python3 scripts/verify-history.py
+python3 scripts/verify-observability.py
 ```
 
 | Script | Verification |
@@ -159,5 +168,6 @@ python3 scripts/verify-history.py
 | `verify-recovery.py` | Worker death, worker/database partition, and database pause; abandoned attempts followed by fenced replacement execution. |
 | `verify-retries.py` | Automatic/permanent failures, manual resumption, retained history, and restart during persisted backoff. |
 | `verify-history.py` | Execution listing, paginated cycles/attempts, filters, errors, and history retained after retry. |
+| `verify-observability.py` | Optional-stack provisioning, separate worker scrapes, saturation, worker death, stalled coordination with UP health, database outage/stale data/alerts, monitoring outage isolation, and scale-out discovery. |
 
-Scripts need no third-party Python packages. Each builds a temporary image and isolated Compose project with disposable ports/storage, then cleans up its own resources. The delivery check uses ordinary engine defaults; other fixtures shorten timings. Allow several minutes, plus initial downloads. Run the full command sequence from a fresh checkout for delivery verification.
+Scripts need no third-party Python packages. Each builds a temporary image and isolated Compose project with disposable ports/storage, then cleans up its own resources. Delivery and observability checks use ordinary engine defaults; recovery/retry/history fixtures shorten timings. The observability script's explicit `--keep` option retains its successful stack for inspection. Allow several minutes, plus initial downloads. Run the full command sequence from a fresh checkout for delivery verification.
