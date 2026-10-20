@@ -1,69 +1,164 @@
 # Distributed Workflow Engine
 
-A Java 21 / Spring Boot engine that executes directed acyclic graph (DAG) workflows across multiple workers. PostgreSQL preserves execution state, results, and history, and coordinates claims, retries, and crash recovery. See the [high-level design](DESIGN.md) for decisions and limitations, and the [Detailed Design](DETAILED_DESIGN.md) for contracts, schema, state transitions, and coordination protocols.
+A Java 21 / Spring Boot distributed DAG workflow engine with parallel execution, persistent state, retries, and worker crash recovery. See the [high-level design](DESIGN.md) for decisions and limitations, and the [Detailed Design](DETAILED_DESIGN.md) for contracts, schema, state transitions, and coordination protocols.
 
 ## Quick Start
 
-### Prerequisites
+Requires Docker with Docker Compose running and internet access for initial downloads. Run commands from the repository root. **Host Java, Maven, and PostgreSQL installations are not required for Docker startup.**
 
-- Docker with Docker Compose and a running daemon.
-- Java 21 JDK for host-side Maven builds. The included Maven Wrapper supplies Maven; set `JAVA_HOME` to your Java 21 installation.
-- Internet access for initial dependency and image downloads. Python 3 is needed for the container verification scripts.
+### Build and run
 
-Run commands from the repository root. No host PostgreSQL installation is required.
+Choose one deployment option. Both expose the workflow API at `http://localhost:8080`.
 
-### Build and run locally
+#### With observability
+
+Starts the engine, PostgreSQL, two workers, Prometheus, and Grafana.
+
+**Run:**
 
 ```sh
-./mvnw clean verify
+docker compose -f docker-compose.yml -f compose.observability.yml up
+```
+
+**Open:**
+
+- [Grafana dashboard](http://localhost:3000/d/dwe-overview) (If not redirect to the dashboard, try to follow: Dashboards --> Workflow Engine --> Workflow Engine -- Operational Overview)
+- [Prometheus](http://localhost:9090)
+
+**Tear down** — run in another terminal:
+
+```sh
+docker compose -f docker-compose.yml -f compose.observability.yml down
+```
+
+#### Without observability
+
+Starts the engine, PostgreSQL, and two workers. This is the assignment's required startup command.
+
+**Run:**
+
+```sh
 docker-compose up
 ```
 
-`verify` builds the application and runs unit and PostgreSQL integration tests; Docker must be available. Compose builds the application image locally and starts PostgreSQL, the API/coordinators, and two workers. The API uses `pull_policy: build`; workers reuse that image with `pull_policy: never`, avoiding application-image registry pulls. Builds reuse cached layers where possible. `docker compose` is an equivalent command spelling. The container build supplies its own Java/Maven tools and skips tests, so run verification separately.
-
-Leave the foreground services running and use a second terminal for the HTTP examples.
-
-For detached startup and rebuilding after source changes:
+**Tear down** — run in another terminal:
 
 ```sh
-docker-compose up --build -d --wait
-docker-compose ps
-curl --fail http://localhost:8080/actuator/health
-```
-
-The API is available at `http://localhost:8080`. Optional local overrides are in [.env.example](.env.example); copy it to `.env` to change host ports or database credentials. Defaults use API port 8080 and database port 5432, both bound to loopback. If Maven selects another JDK, check `JAVA_HOME` and `./mvnw -version`.
-
-```sh
-docker-compose logs --tail=100 api worker
 docker-compose down
 ```
 
-`down` retains the named PostgreSQL volume and stored executions. Removing that volume deletes their state. This deployment is intended for local evaluation and has no authentication.
+Both options build the application image automatically and display logs in the terminal. Leave the services running and use a second terminal for the examples below. `docker compose` and `docker-compose` are equivalent command spellings with modern Compose.
 
-### Build and run with observability (optional)
+Shutdown retains stored executions. Add `--volumes` to the appropriate teardown command to delete that deployment's database and, when enabled, monitoring data.
 
-Use the Compose overlay to include Prometheus and the provisioned Grafana dashboard. The same Maven verification above applies to both deployments:
+### Submit sample workflows
+
+These commands work with either deployment option. Each submission returns an `executionId`; use it in the inspection commands below.
+
+**Sequential execution** — `start → wait → finish`:
 
 ```sh
-docker compose -f docker-compose.yml -f compose.observability.yml up --build -d --wait
-docker compose -f docker-compose.yml -f compose.observability.yml ps
+curl --fail -H 'Content-Type: application/json' \
+  --data-binary @examples/sequential.json \
+  http://localhost:8080/api/v1/executions
 ```
 
-The workflow API remains at `http://localhost:8080`. Open the [Grafana dashboard](http://localhost:3000/d/dwe-overview) and [Prometheus](http://localhost:9090) to inspect backlog, capacity, attempt outcomes, recovery, and alerts. Monitoring ports bind to loopback; anonymous Grafana viewing is enabled for local evaluation. Management endpoints move to internal port 9091 in this mode; check API readiness from inside its container:
+**Parallel execution** — `start → (branch-b, branch-c) → join → finish`; the join waits for both branches:
 
 ```sh
+curl --fail -H 'Content-Type: application/json' \
+  --data-binary @examples/parallel.json \
+  http://localhost:8080/api/v1/executions
+```
+
+**Automatic retries** — `work` fails twice, waits 300 then 600 ms, and succeeds on attempt 3:
+
+```sh
+curl --fail -H 'Content-Type: application/json' \
+  --data-binary @examples/retry.json \
+  http://localhost:8080/api/v1/executions
+```
+
+**Manual retry** — `work` exhausts three attempts; manual resumption preserves `start` and succeeds on lifetime attempt 4:
+
+```sh
+curl --fail -H 'Content-Type: application/json' \
+  --data-binary @examples/manual-retry.json \
+  http://localhost:8080/api/v1/executions
+```
+
+### Inspect an execution and retry failures
+
+Copy an `executionId` from a submission response:
+
+```sh
+EXECUTION_ID='paste-returned-id-here'
+
+# Execution status and step summaries
+curl --fail "http://localhost:8080/api/v1/executions/$EXECUTION_ID"
+
+# Attempt history, including worker identities and outcomes
+curl --fail "http://localhost:8080/api/v1/executions/$EXECUTION_ID/attempts?limit=10"
+
+# List recent executions
+curl --fail 'http://localhost:8080/api/v1/executions'
+```
+
+Repeat the execution query until `COMPLETED` or `FAILED`. To inspect the sequential example's final output, use its execution ID:
+
+```sh
+curl --fail "http://localhost:8080/api/v1/executions/$EXECUTION_ID/steps/finish"
+```
+
+For the manual-retry example, set `EXECUTION_ID` to its returned ID and wait until `retryAllowed` is `true`, then run:
+
+```sh
+curl --fail -X POST "http://localhost:8080/api/v1/executions/$EXECUTION_ID/retry"
+curl --fail "http://localhost:8080/api/v1/executions/$EXECUTION_ID/cycles"
+```
+
+### Try a realistic demo: provider record quality
+
+Process five synthetic provider-directory records through parallel normalization and validation, producing four cleaned records and three data-quality findings. Requires Python 3 and the running engine.
+
+```sh
+python3 demo/provider-quality/client.py
+```
+
+The client prints progress and findings, and exports `report.json` and `cleaned-providers.json` under `provider-output/<execution-id>/`. See [PROVIDER_RECORDS_VALIDATION_DEMO.md](PROVIDER_RECORDS_VALIDATION_DEMO.md) for rules, re-export, retry/crash demonstrations, and verification. The demo uses registered business handlers and existing APIs without special engine coordination or schema changes.
+
+## Runtime Details and Configuration
+
+### Configuration and image builds
+
+Optional local overrides are in [.env.example](.env.example); copy it to `.env` to change host ports or database credentials. Defaults use API port 8080 and database port 5432, both bound to loopback. The examples above assume default ports. This deployment is intended for local evaluation and has no authentication.
+
+Compose builds the application image using the Java/Maven tools in its Docker build stage. The API uses `pull_policy: build`; workers reuse that image with `pull_policy: never`, avoiding application-image registry pulls. Builds reuse cached layers where possible. Run the [Maven tests](#maven-tests) separately to verify the source and integration behavior.
+
+### Background startup, status, and logs
+
+For background startup that waits for services to be running or healthy, use the command matching your deployment option.
+
+**Without observability:**
+
+```sh
+docker-compose up -d --wait
+docker-compose ps
+docker-compose logs --tail=100 api worker
+curl --fail http://localhost:8080/actuator/health
+```
+
+**With observability:**
+
+```sh
+docker compose -f docker-compose.yml -f compose.observability.yml up -d --wait
+docker compose -f docker-compose.yml -f compose.observability.yml ps
+docker compose -f docker-compose.yml -f compose.observability.yml logs --tail=100 api worker
 docker compose -f docker-compose.yml -f compose.observability.yml exec api \
   curl --fail http://localhost:9091/actuator/health/readiness
 ```
 
-Keep both Compose files in subsequent commands. For logs or shutdown:
-
-```sh
-docker compose -f docker-compose.yml -f compose.observability.yml logs --tail=100 api worker
-docker compose -f docker-compose.yml -f compose.observability.yml down
-```
-
-`down` retains the database and monitoring volumes. See [OBSERVABILITY.md](OBSERVABILITY.md) for configuration, metric semantics, failure demonstrations, and cleanup details.
+Keep both Compose files in subsequent commands when using observability. Management endpoints move to internal port 9091 in this mode; the business API remains on port 8080. Monitoring ports bind to loopback, and anonymous Grafana viewing is enabled for local evaluation. See [OBSERVABILITY.md](OBSERVABILITY.md) for configuration, metric semantics, failure demonstrations, and cleanup details.
 
 ## Architecture Overview
 
@@ -108,59 +203,25 @@ One Maven artifact runs with either the `api` or `worker` profile. Compose start
 
 **Purple dashed boxes and dotted connections identify optional observability components.** The API's sampler caches aggregate database observations; Prometheus reads that cache and process metrics through management endpoints, scraping each worker independently. Grafana queries Prometheus for visualization. These components observe execution; workflow progress does not depend on Prometheus or Grafana.
 
-## Example Usage
+## API Reference and Additional Examples
 
-### Provider records validation demo
+### Submission and retry behavior
 
-The business demo processes five synthetic provider-directory records through parallel normalization and validation, producing four cleaned records and three data-quality findings. With the current application image running, use the standalone HTTP client:
+Successful submission returns `201 Created` with an `executionId` and a `Location` header. Execution detail includes step summaries; step detail includes persisted output/error. The [submission schema](src/main/resources/schemas/execution-submission.schema.json) describes the request structure; the server also checks DAG validity and registered actions.
 
-```sh
-python3 demo/provider-quality/client.py
-```
+Manual retry returns `200 OK` with the same execution ID and an increased `currentCycleNo`. Completed outputs and history are preserved; failed steps receive fresh per-cycle allowances. Active/completed workflows or unfinished attempts produce `409`. `maxAttempts` includes the first claim, and abandoned claims consume allowance. Automatic retries use capped exponential backoff; permanent errors skip automatic retry.
 
-It prints progress/findings and exports `report.json` and `cleaned-providers.json` under `provider-output/<execution-id>/`. See [PROVIDER_RECORDS_VALIDATION_DEMO.md](PROVIDER_RECORDS_VALIDATION_DEMO.md) for rules, re-export, retry/crash demonstrations, and verification. Presentation uses existing APIs; the engine, worker runtime, API server, schema, and monitoring are unchanged.
+### Permanent failures and crash recovery
 
-### Submit and monitor a workflow
-
-The [sequential example](examples/sequential.json) runs `start → wait → finish`:
+Submit [permanent-failure.json](examples/permanent-failure.json) to see a permanent error fail immediately; an explicit manual retry can succeed:
 
 ```sh
-curl --fail -i -H 'Content-Type: application/json' \
-  --data-binary @examples/sequential.json \
+curl --fail -H 'Content-Type: application/json' \
+  --data-binary @examples/permanent-failure.json \
   http://localhost:8080/api/v1/executions
 ```
 
-The response is `201 Created` with an `executionId` and a `Location` header. Set the returned ID, then inspect progress and results:
-
-```sh
-EXECUTION_ID='paste-returned-id-here'
-curl --fail "http://localhost:8080/api/v1/executions/$EXECUTION_ID"
-curl --fail "http://localhost:8080/api/v1/executions/$EXECUTION_ID/steps/finish"
-curl --fail "http://localhost:8080/api/v1/executions/$EXECUTION_ID/attempts?limit=10"
-```
-
-Repeat the execution query until `COMPLETED` or `FAILED`. Execution detail includes step summaries; step detail includes persisted output/error. Attempt history includes worker IDs, timing, and outcomes. The [submission schema](src/main/resources/schemas/execution-submission.schema.json) describes the request structure; the server also checks DAG validity and registered actions.
-
-### Try parallel execution, retries, and recovery
-
-Submit these files with the same POST command, changing the filename:
-
-| Sample | Expected behavior |
-| --- | --- |
-| [parallel.json](examples/parallel.json) | `start → (branch-b, branch-c) → join → finish`; branches overlap and the join waits for both. |
-| [retry.json](examples/retry.json) | `work` fails twice, waits 300 then 600 ms, and succeeds on attempt 3. |
-| [manual-retry.json](examples/manual-retry.json) | `work` exhausts three attempts; manual retry preserves `start` and succeeds on lifetime attempt 4. |
-| [permanent-failure.json](examples/permanent-failure.json) | A permanent error fails immediately; an explicit manual retry can succeed. |
-| [recovery.json](examples/recovery.json) | A long-running step used by the worker-crash and connectivity verification script. |
-
-Set `EXECUTION_ID` to the failed example's returned ID. Wait until `retryAllowed` is true, then send a bodyless request:
-
-```sh
-curl --fail -X POST "http://localhost:8080/api/v1/executions/$EXECUTION_ID/retry"
-curl --fail "http://localhost:8080/api/v1/executions/$EXECUTION_ID/cycles"
-```
-
-Retry returns `200 OK` with the same ID and an increased `currentCycleNo`. Completed outputs and history are preserved; failed steps receive fresh per-cycle allowances. Active/completed workflows or unfinished attempts produce `409`. `maxAttempts` includes the first claim, and abandoned claims consume allowance. Automatic retries use capped exponential backoff; permanent errors skip automatic retry.
+The [recovery example](examples/recovery.json) contains a long-running step used by the [recovery verification script](scripts/verify-recovery.py). See [End-to-end container checks](#end-to-end-container-checks) for automated worker-crash and connectivity-failure demonstrations.
 
 ### API reference
 
@@ -185,6 +246,8 @@ Collection responses contain `items` and `nextCursor`. `limit` defaults to 50, w
 ## Testing Instructions
 
 ### Maven tests
+
+Install a Java 21 JDK and set `JAVA_HOME` to its installation directory. The included Maven Wrapper supplies Maven; check `./mvnw -version` if it selects another JDK. This verification applies to both deployment options and is separate from Docker startup, whose image build skips tests.
 
 ```sh
 ./mvnw test
