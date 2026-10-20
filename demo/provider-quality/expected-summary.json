@@ -1,0 +1,9 @@
+{
+  "inputRecords": 5,
+  "cleanedRecords": 4,
+  "uniqueProviderIds": 4,
+  "duplicatesRemoved": 1,
+  "validationFindings": 2,
+  "conflicts": 0,
+  "totalFindings": 3
+}

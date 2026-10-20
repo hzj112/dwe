@@ -36,6 +36,8 @@ Permanent failure or exhausted allowance atomically fails the step, current cycl
 
 Current step summaries are separate from durable attempt and cycle history. Paginated read-only APIs expose progress without advancing execution. Registered `StepHandler` implementations receive isolated JSON inputs, parameters, direct dependency outputs, and a stable execution/step idempotency key; orchestration does not depend on business action names.
 
+The [provider records validation demo](PROVIDER_RECORDS_VALIDATION_DEMO.md) exercises that extension contract with five business handlers and an external HTTP client. Handlers return report/cleaned-data JSON through ordinary persisted step outputs; the client handles presentation and local file export. Data-quality findings are successful business results, while malformed input is a permanent error and explicitly simulated transient faults use the existing retry mechanism. No domain-specific routes, runtime logic, or schema changes are required.
+
 ### Operational observability
 
 An optional Compose overlay adds Prometheus and a provisioned Grafana dashboard using the same application image. Micrometer records process capacity, operations, and lifecycle transitions; structured logs carry execution identities without adding them as metric labels. Newly applied lifecycle events are emitted after transaction commit, so rollback and duplicate reports do not inflate completion counts. Telemetry remains best effort and never replaces durable history.

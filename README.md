@@ -77,6 +77,16 @@ Open the provisioned [Grafana dashboard](http://localhost:3000/d/dwe-overview) a
 
 ## Example Usage
 
+### Provider records validation demo
+
+The business demo processes five synthetic provider-directory records through parallel normalization and validation, producing four cleaned records and three data-quality findings. With the current application image running, use the standalone HTTP client:
+
+```sh
+python3 demo/provider-quality/client.py
+```
+
+It prints progress/findings and exports `report.json` and `cleaned-providers.json` under `provider-output/<execution-id>/`. See [PROVIDER_RECORDS_VALIDATION_DEMO.md](PROVIDER_RECORDS_VALIDATION_DEMO.md) for rules, re-export, retry/crash demonstrations, and verification. Presentation uses existing APIs; the engine, worker runtime, API server, schema, and monitoring are unchanged.
+
 ### Submit and monitor a workflow
 
 The [sequential example](examples/sequential.json) runs `start → wait → finish`:
@@ -160,6 +170,7 @@ python3 scripts/verify-recovery.py
 python3 scripts/verify-retries.py
 python3 scripts/verify-history.py
 python3 scripts/verify-observability.py
+python3 scripts/verify-provider-demo.py
 ```
 
 | Script | Verification |
@@ -169,5 +180,6 @@ python3 scripts/verify-observability.py
 | `verify-retries.py` | Automatic/permanent failures, manual resumption, retained history, and restart during persisted backoff. |
 | `verify-history.py` | Execution listing, paginated cycles/attempts, filters, errors, and history retained after retry. |
 | `verify-observability.py` | Optional-stack provisioning, separate worker scrapes, saturation, worker death, stalled coordination with UP health, database outage/stale data/alerts, monitoring outage isolation, and scale-out discovery. |
+| `verify-provider-demo.py` | Provider report/cleaned-data export, re-export without resubmission, transient validation failure/backoff, and worker death/lease recovery with identical business results. Add `--observability --keep` to inspect a retained monitored demo. |
 
-Scripts need no third-party Python packages. Each builds a temporary image and isolated Compose project with disposable ports/storage, then cleans up its own resources. Delivery and observability checks use ordinary engine defaults; recovery/retry/history fixtures shorten timings. The observability script's explicit `--keep` option retains its successful stack for inspection. Allow several minutes, plus initial downloads. Run the full command sequence from a fresh checkout for delivery verification.
+Scripts need no third-party Python packages. Each builds a temporary image and isolated Compose project with disposable ports/storage, then cleans up its own resources. Delivery, observability, and provider-demo checks use ordinary engine defaults; recovery/retry/history fixtures shorten timings. The observability and provider-demo scripts' explicit `--keep` options retain successful stacks for inspection. Allow several minutes, plus initial downloads. Run the full command sequence from a fresh checkout for delivery verification.

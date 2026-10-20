@@ -1,0 +1,96 @@
+{
+  "definition": {
+    "steps": [
+      {
+        "id": "load-records",
+        "actionType": "PROVIDER_LOAD"
+      },
+      {
+        "id": "normalize-records",
+        "actionType": "PROVIDER_NORMALIZE",
+        "parameters": {
+          "sourceStep": "load-records"
+        },
+        "dependsOn": [
+          "load-records"
+        ]
+      },
+      {
+        "id": "validate-records",
+        "actionType": "PROVIDER_VALIDATE",
+        "parameters": {
+          "sourceStep": "load-records",
+          "demoFailFirstAttempt": true
+        },
+        "dependsOn": [
+          "load-records"
+        ],
+        "retry": {
+          "maxAttempts": 3,
+          "backoffInitialMs": 1000,
+          "backoffMaxMs": 2000
+        }
+      },
+      {
+        "id": "summarize-quality",
+        "actionType": "PROVIDER_SUMMARIZE",
+        "parameters": {
+          "normalizedStep": "normalize-records",
+          "validatedStep": "validate-records"
+        },
+        "dependsOn": [
+          "normalize-records",
+          "validate-records"
+        ]
+      },
+      {
+        "id": "publish-report",
+        "actionType": "PROVIDER_FINALIZE",
+        "parameters": {
+          "summaryStep": "summarize-quality"
+        },
+        "dependsOn": [
+          "summarize-quality"
+        ]
+      }
+    ]
+  },
+  "inputs": {
+    "records": [
+      {
+        "providerId": "P001",
+        "name": "Alice Smith",
+        "specialty": "Cardiology",
+        "state": "MA",
+        "email": "alice@example.com"
+      },
+      {
+        "providerId": "P002",
+        "name": "Bob Jones",
+        "specialty": "Neurology",
+        "state": "MA",
+        "email": "bob@example.com"
+      },
+      {
+        "providerId": "P003",
+        "name": "Carol Lee",
+        "specialty": "Dermatology",
+        "state": "NY"
+      },
+      {
+        "providerId": "P004",
+        "name": "David Chen",
+        "specialty": "Cardiology",
+        "state": "XX",
+        "email": "david@example.com"
+      },
+      {
+        "providerId": "P002",
+        "name": "Bob Jones",
+        "specialty": "Neurology",
+        "state": "MA",
+        "email": "bob@example.com"
+      }
+    ]
+  }
+}

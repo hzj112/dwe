@@ -6,7 +6,7 @@ Design references: [high-level design](DESIGN.md) and [Detailed Design](DETAILED
 
 ## Status and Priorities
 
-Milestone 1 records the design work completed before implementation. Milestones 2–7 are implemented and committed, with milestone 7 committed as `c403b14`. The separately approved optional sub-milestone 10a adds observability and failure diagnosis; its checkpoint is below. Other optional milestones and the remaining scope of milestone 10 have not started.
+Milestone 1 records the design work completed before implementation. Milestones 2–7 are implemented and committed, with milestone 7 committed as `c403b14`. The separately approved optional sub-milestone 10a adds observability and failure diagnosis; its checkpoint is below. The final provider-records application demo is also implemented and locally verified. Other optional milestones and the remaining scope of milestone 10 have not started.
 
 Priority order:
 
@@ -174,6 +174,18 @@ These are proposed extensions, not requirements for submission. Each receives it
 **Findings and limits:** Successful coordinator passes can skip locked workflows, so a persistent awaiting-promotion alert checks progress independently of loop activity. Retained metric gauge suppliers prevent worker capacity from becoming NaN after garbage collection. The small demonstration workload showed an approximately 16ms p95 histogram estimate for successful database collection; this is not a load benchmark or production SLO. Counter crash gaps, sampling lag, Compose-specific deployment, and the single designated sampler assumption are documented in the runbook. No later milestone has started.
 
 **Boundary:** This is the approved observability subset of milestone 10, using in-memory instrumentation plus aggregate database sampling. No summary tables, CDC, event-projection pipeline, distributed tracing, centralized logs, external notifications, backup/restore, or Kubernetes deployment are introduced. These remain separately scoped follow-ups. See [OBSERVABILITY.md](OBSERVABILITY.md).
+
+### Final Application Demo — Provider Records Validation
+
+**Outcome:** A realistic application consumes DWE through existing contracts, demonstrating parallel business processing, persisted results, retries, and worker-crash recovery. A standalone HTTP client presents the report and exports cleaned records outside the engine.
+
+**Scope:** Five registered demo handlers execute load → parallel normalization/validation → summary → finalization. Synthetic records produce four cleaned records and three findings from five input rows. Exact duplicates are removed, conflicting IDs are retained/reported, and invalid business fields become findings. Separate retry/crash fixtures enable explicit first-attempt faults. The external client supports submit, monitor, local JSON export, and re-export of an existing execution. An isolated Compose walkthrough verifies all three modes against equivalent business outputs.
+
+**Acceptance:** The supplied dataset produces the documented report; branch overlap/join ordering, retry backoff, durable output retrieval, and actual worker death/lease recovery are verified. Core engine, worker runtime, persistence, API server, schema, and monitoring are unchanged. No special report API is introduced.
+
+**Status:** Implemented and locally verified on 2026-10-19. Clean Maven verification passed 94 unit tests and 117 PostgreSQL integration tests without failures/errors/skips. All 12 client tests passed. The final monitored provider walkthrough and original delivery/restart checks passed. No additional optional milestone has started.
+
+**Design, operation, and limits:** [PROVIDER_RECORDS_VALIDATION_DEMO.md](PROVIDER_RECORDS_VALIDATION_DEMO.md) owns the complete business rules, output contracts, CLI commands, fault scenarios, verification evidence, and known limits. This bounded application example does not implement the broader optional developer/operator-usability roadmap.
 
 ### Optional roadmap
 
