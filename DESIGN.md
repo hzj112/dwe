@@ -4,6 +4,26 @@ This document explains the implemented design and its limits. [README.md](README
 
 The companion [Detailed Design](DETAILED_DESIGN.md) preserves the handler/API contracts, database schema, lifecycle state machines, coordination protocols, worker behavior, and full decision register from the original design. Read this document for the high-level decisions and the companion for implementation details.
 
+## Assumptions and Scope
+
+The initial design relies on the following workload, handler, and deployment assumptions. They explain the boundaries within which the coordination guarantees apply.
+
+| Assumption | Description |
+| --- | --- |
+| Workflows are static DAGs | Steps and dependencies are fixed at submission. Loops, dynamically generated steps, and recurring schedules are outside the initial scope. |
+| Executions retain their submitted configuration | Definitions, inputs, parameters, and effective retry policies remain unchanged during execution and manual retry. Changing them requires a new submission. |
+| Handlers are trusted application code | Handlers are implemented and registered before deployment. The engine does not sandbox uploaded code or execute arbitrary user commands. |
+| Handler deployments remain compatible | API and workers share compatible handler registrations and contracts. Definition snapshots preserve configuration, but do not freeze deployed handler code. |
+| Handlers support concurrent invocation | Multiple workers or threads may invoke the same handler implementation. Handlers must be stateless or thread-safe. |
+| Repeated business execution is acceptable or deduplicated | Failures can cause a step to execute again. Handlers with external effects must provide idempotency or downstream deduplication; fencing protects engine state only. |
+| Completed outputs remain valid for manual retry | Manual retry reuses successful results and assumes their associated external effects remain valid. Fresh computation requires a new execution. |
+| PostgreSQL remains the single authority | Coordination relies on one writable PostgreSQL database and its transaction guarantees. The initial deployment does not provide database replication or automatic failover. |
+| Recovery requires restored infrastructure | Eventual progress assumes database connectivity, coordinator availability, worker capacity, and remaining retry allowance. Persistent outages can pause execution indefinitely. |
+| Database time is suitable for lease decisions | Lease expiry uses database time rather than agreement between worker clocks. Large database clock jumps can affect lease timing; workers use monotonic time for their local safety window. |
+| Handlers cooperate with cancellation and manage external calls | Interruption is best effort. Handlers should check cancellation and use appropriate external-call timeouts; leases do not impose a maximum execution duration. |
+| Initial workloads fit a local evaluation deployment | DAGs, JSON payloads, and retained history are expected to fit available database and process resources. No production throughput, strict scheduling latency, or fairness guarantee has been established. |
+| Deployment is a trusted local environment | Authentication, authorization, tenant isolation, and production secrets management are deferred. Published ports bind to loopback for local evaluation. |
+
 ## Architecture Decisions
 
 ### Technology and component boundaries
