@@ -6,7 +6,7 @@ Current status: core milestones 1–7 are complete, with milestone 7 committed a
 
 Prepared on 2026-10-17 (America/New_York) for review before application code generation, with environment results updated after Docker Desktop was started. Milestone 2 was subsequently authorized and implemented. The environment-validation sections below preserve the observations made before implementation; the checkpoint records the newer project-specific results. No global shell-profile changes have been made.
 
-The architecture and contracts in [DESIGN.md](DESIGN.md) govern implementation. [PROJECT_DESCRIPTION.md](PROJECT_DESCRIPTION.md) defines the must-have scope, and [AGENTS.md](AGENTS.md) requires one approved milestone at a time. The original [assignment PDF](<Take Home Distributed Systems Exercise - athenahealth.pdf>) was reread, including its technical constraints and deliverables. `PROJECT_CONTEXT.md` is referenced in the instructions but is not currently present on disk; the existing description and approved design provide the implementation context.
+The architecture and contracts in [DESIGN.md](DESIGN.md) govern implementation. [PROJECT_DESCRIPTION.md](PROJECT_DESCRIPTION.md) defines the must-have scope, and [AGENTS.md](AGENTS.md) requires one approved milestone at a time.
 
 Milestone 1 (design) is recorded. Milestone 2 is the first proposed coding scope. Later milestones below describe the remaining delivery path; listing them does not authorize starting them automatically. At each boundary, report changes, actual test results, limitations, and remaining risks; recommend a checkpoint commit and wait for approval before the next milestone. Do not commit or push without explicit approval.
 
